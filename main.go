@@ -105,9 +105,8 @@ func (n *ChordNode) PrintState() {
 			i, idToHex(s.ID), s.IP, s.Port)
 	}
 
-	fmt.Println("First 4 fingers:")
-	for i := 0; i < 4 && i < len(n.Fingers); i++ {
-		f := n.Fingers[i]
+	fmt.Println("Finger table:")
+	for i, f := range n.Fingers {
 		fmt.Printf("  [%d] id=%s ip=%s port=%d\n",
 			i, idToHex(f.ID), f.IP, f.Port)
 	}
@@ -244,6 +243,55 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		for _, s := range n.Successors {
 			fmt.Fprintf(conn, "%s %s %d\n", idToHex(s.ID), s.IP, s.Port)
 		}
+	case "GETRANGE":
+		// GETRANGE <lowHex> <highHex>
+		if len(parts) != 3 {
+			fmt.Fprintln(conn, "ERR")
+			return
+		}
+
+		lowHex := parts[1]
+		highHex := parts[2]
+
+		lowID, err1 := parseHexToID(lowHex)
+		highID, err2 := parseHexToID(highHex)
+		if err1 != nil || err2 != nil {
+			fmt.Fprintln(conn, "ERR")
+			return
+		}
+
+		// Collect matching keys
+		sendList := make([]FileRecord, 0)
+		sendKeys := make([]string, 0)
+
+		for keyHex, rec := range n.Files {
+			keyID, err := parseHexToID(keyHex)
+			if err != nil {
+				continue
+			}
+
+			if inInterval(keyID, lowID, highID, true) {
+				sendList = append(sendList, rec)
+				sendKeys = append(sendKeys, keyHex)
+			}
+		}
+
+		// Send count
+		fmt.Fprintf(conn, "COUNT %d\n", len(sendList))
+
+		// Send each file (header + content)
+		for i := range sendList {
+			rec := sendList[i]
+			key := sendKeys[i]
+			fmt.Fprintf(conn, "%s %s %d\n", key, rec.Name, len(rec.Content))
+			conn.Write([]byte(rec.Content))
+		}
+
+		// Delete migrated keys
+		for _, k := range sendKeys {
+			delete(n.Files, k)
+		}
+		return
 
 	default:
 		fmt.Fprintln(conn, "ERR unknown command")
@@ -271,7 +319,17 @@ func (n *ChordNode) ListenAndServe() error {
 }
 
 func (n *ChordNode) stabilize() {
+	// First check: is successor alive?
+	if err := tryPing(n.Successors[0]); err != nil {
+		if len(n.Successors) > 1 {
+			n.Successors[0] = n.Successors[1]
+		}
+		return // stop stabilize early
+	}
+
+	// Now safe to query successor
 	x := rpcGetPredecessor(n.Successors[0])
+
 	if x != nil && inInterval(x.ID, n.Self.ID, n.Successors[0].ID, false) {
 		n.Successors[0] = *x
 	}
@@ -352,25 +410,34 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 }
 
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
+	// Start at ourselves
 	cur := n.Self
+
 	for {
-		// Ask the current node for its successor
+		// Ask the current node who its successor is
 		succ := rpcGetSuccessor(cur)
 		if succ == nil {
 			return nil
 		}
 
-		// If id is in (cur, succ], then succ is the answer
+		// If the ID is between cur and succ → answer found
 		if inInterval(id, cur.ID, succ.ID, true) {
 			return succ
 		}
 
-		// Otherwise get closest preceding finger of cur
-		cpf := n.closestPrecedingFinger(id)
+		// Ask THAT node (not us!) for its closest preceding finger
+		cpf := rpcClosestPrecedingFinger(cur, id)
+		if cpf == nil {
+			return succ
+		}
+
+		// If no progress can be made, give up and return successor
 		if cpf.ID.Cmp(cur.ID) == 0 {
 			return succ
 		}
-		cur = cpf
+
+		// Hop to next node
+		cur = *cpf
 	}
 }
 
@@ -448,6 +515,36 @@ func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 
 	return &NodeInfo{
 		ID:   id,
+		IP:   parts[1],
+		Port: portVal,
+	}
+}
+
+func rpcClosestPrecedingFinger(target NodeInfo, id *NodeID) *NodeInfo {
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CPF %s\n", idToHex(id))
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return nil
+	}
+
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) != 3 {
+		return nil
+	}
+
+	nid, _ := parseHexToID(parts[0])
+	portVal, _ := strconv.Atoi(parts[2])
+
+	return &NodeInfo{
+		ID:   nid,
 		IP:   parts[1],
 		Port: portVal,
 	}
@@ -578,6 +675,60 @@ func rpcGetFile(target NodeInfo, key string) *FileRecord {
 	}
 }
 
+func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "GETRANGE %s %s\n", lowHex, highHex)
+
+	reader := bufio.NewReader(conn)
+
+	// First line must be: COUNT <n>
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil
+	}
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) != 2 || parts[0] != "COUNT" {
+		return nil
+	}
+
+	count, _ := strconv.Atoi(parts[1])
+	result := make(map[string]FileRecord)
+
+	for i := 0; i < count; i++ {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		h := strings.Fields(strings.TrimSpace(header))
+		if len(h) != 3 {
+			break
+		}
+
+		key := h[0]
+		name := h[1]
+		size, _ := strconv.Atoi(h[2])
+
+		buf := make([]byte, size)
+		_, err = io.ReadFull(reader, buf)
+		if err != nil {
+			break
+		}
+
+		result[key] = FileRecord{
+			Name:    name,
+			Content: string(buf),
+		}
+	}
+
+	return result
+}
+
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.Dial("tcp", addr)
@@ -631,6 +782,17 @@ func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 	}
 
 	return result
+}
+
+func tryPing(n NodeInfo) error {
+	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	fmt.Fprintln(conn, "PING")
+	return nil
 }
 
 func main() {
@@ -739,6 +901,25 @@ func main() {
 		}
 
 		node.Successors[0] = *succ
+		// Attempt immediate key migration from successor
+		succLow := node.Predecessor
+		if succLow == nil {
+			// if we don't know predecessor yet, assume full interval from successor->self
+			succLow = &NodeInfo{ID: succ.ID}
+		}
+
+		lowHex := idToHex(succLow.ID)
+		highHex := idToHex(myID)
+
+		files := rpcGetRange(*succ, lowHex, highHex)
+		if files != nil {
+			for k, rec := range files {
+				node.Files[k] = rec
+			}
+		}
+
+		fmt.Println("Migrated", len(files), "keys from successor.")
+
 		fmt.Println("Joined ring. My successor is:", idToHex(succ.ID), succ.IP, succ.Port)
 	} else {
 		fmt.Println("Created new ring (successor = self)")
@@ -835,20 +1016,23 @@ func main() {
 				continue
 			}
 
+			fmt.Printf("Owner: %s %s %d\n",
+				idToHex(succ.ID), succ.IP, succ.Port)
+
 			if succ.ID.Cmp(node.Self.ID) == 0 {
-				// local
 				rec, ok := node.Files[keyHex]
 				if !ok {
-					fmt.Println("Not found locally")
+					fmt.Println("File not found locally")
+					continue
 				}
 				fmt.Println(rec.Content)
 			} else {
 				rec := rpcGetFile(*succ, keyHex)
 				if rec == nil {
 					fmt.Println("File not found on remote node")
-				} else {
-					fmt.Println(rec.Content)
+					continue
 				}
+				fmt.Println(rec.Content)
 			}
 
 		default:
