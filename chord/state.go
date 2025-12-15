@@ -31,6 +31,8 @@ type ChordNode struct {
 	R int // number of successors maintained, this stores the value of r from the command line -r
 	// it tells how long the successors slice should be, example if the user runs -r 4 then R = 4 and you keep 4 successors
 
+	nextFinger int
+	files      map[string]string
 }
 
 // chordNode constructor. Creates a new Chord node object, fills in its identity (self), allocates space for successor list and finger table, sets predecessor to unkown (nil) and returns the node pointer
@@ -51,6 +53,9 @@ func NewChordNode(ip string, port int, id *big.Int, r int) *ChordNode { // it ta
 		Successors:  make([]NodeInfo, r), //creates a slice (list) of NodeInfo values. Its length is r. This will hold the successor list: Successors[0] is the immediate successor. The rest of the successor are backups
 		Fingers:     make([]NodeInfo, M), //creates the finger slice, length is M(which is set to 160).
 		R:           r,                   //stores the configuration value r into the node struct.
+
+		nextFinger: 0,
+		files:      make(map[string]string),
 	} // now n points to a chordNode that has: self= correct, predecessor = nil, successors slice allocated, fingers slice allocated, r stored
 
 	return n // returns the pointer to the newly created node, the caller receives a usable *ChordNode
@@ -75,7 +80,7 @@ func (n *ChordNode) CreateRing() { // a methid on ChordNode, n *ChordNode means 
 
 }
 
-func (n *ChordNode) ParticipateRingWithKnownSuccessor(known NodeInfo) { // defines a method in ChordNode, known NodeInfo is the one node that already exsists in the ring. In the real program: known would be the node you connect with using: --ja and --jp
+func (n *ChordNode) JoinRingWithKnownSuccessor(known NodeInfo) { // defines a method in ChordNode, known NodeInfo is the one node that already exsists in the ring. In the real program: known would be the node you connect with using: --ja and --jp
 
 	n.mu.Lock()         // Locks the node state so nothing else changed it mid-update
 	defer n.mu.Unlock() // run this at the end of the function

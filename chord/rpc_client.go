@@ -3,6 +3,7 @@ package chord
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"time"
 )
@@ -101,3 +102,80 @@ func RPCNotify(address string, me NodeInfo) error { // tell a remote node you sh
 	return sendRPC(address, req, nil)                         // send the request to the remote node, no return data expected so out is nil. Return error if it fails
 	// this is the "notify" step in stabilization, successor.notify(n) in the chord paper
 }
+
+func RPCGetSelf(address string) (NodeInfo, error) {
+	req := RPCRequest{Type: "GetSelf", Body: nil}
+	var dto NodeInfoDTO
+	if err := sendRPC(address, req, &dto); err != nil {
+		return NodeInfo{}, err
+	}
+
+	return fromDTO(dto)
+}
+
+
+func RPCFindSuccessorStep(address string, key *big.Int) (NodeInfo, bool, error){
+	body, _ := json.Marshal(FindSuccessorReq{Key: key.Text(16)})
+	req := RPCRequest{Type: "FindSuccessorStep", Body: body}
+
+
+	var resp FindSuccessorResp 
+	if err := sendRPC(address, req, &resp); err != nil {
+		return NodeInfo{}, false, err
+	}
+
+	ni, err _ = fromDTO(resp.Node)
+	if err != nil {
+		return NodeInfo{}, false, err
+	}
+	return ni, resp.Done, nil
+}
+
+
+func RPCGetSuccessorList(address string) ([]NodeInfo, error) {
+	req := RPCRequest{Type: "GetSuccessorList", Body: nil}
+	var dtos []NodeInfoDTO
+	if err := sendRPC(address, req, &dtos); err != nil {
+		return nil, err
+	}
+
+	out := make([]NodeInfo, 0, len(dtos))
+	for _, d := range dtos {
+		ni, err := fromDTO(d)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ni)
+	}
+	return out, nil 
+}
+
+func RPCStoreFile(address, name, content string) error {
+	body, _ := json.Marshal(StoreFileReq{Name: name, Content: content})
+	req := RPCReques{Type: "StoreFile", Body:body}
+	return sendRPC(address, req, nil)
+}
+
+
+func RPCGetFile(address, name string) (bool, string, error) {
+	body, _ := json.Marshal(GetFileReq{Name: name})
+	req := RPCRequest{Type: "GetFile", Body: body}
+
+	var resp GetFileResp
+	if err := sendRPC(address, req, &resp); err != nil {
+		return false, "", err
+	}
+	return resp.Found, resp.Content, nil 
+}
+
+func RPCListFiles (address string) ([]string, error) {
+	req := RPCRequest{Type: "ListFiles", Body:nil}
+	var resp StateFilesResp
+	if err := sendRPC(address, req, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Files, nil 
+
+}
+
+

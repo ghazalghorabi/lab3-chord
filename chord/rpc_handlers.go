@@ -58,6 +58,26 @@ func (n *ChordNode) handleRPC(req RPCRequest) RPCResponse { //called after a req
 
 		return RPCResponse{OK: true, Data: toDTO(*n.Predecessor)} // otherwise send predeccesoor info
 
+	case "GetSelf":
+		return RPCResponse{OK: true, Data: toDTO(n.Self)}
+
+	case "GetSuccessorList":
+		n.mu.Lock()
+		dtos := make([]NodeInfoDTO, 0, len(n.Successors))
+		for _, s := range n.Successors {
+			dtos = append(dtos, toDTO(s))
+		}
+		n.mu.Unlock()
+		return RPCResponse{OK: true, Data: dtos}
+
+	case "FindSuccessorStep":
+		var body FindSuccessorReq
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return RPCResponse{OK: false, Error: err.Error()}
+		}
+
+		key, ok := new(big.Int).SetString
+
 	case "Notify":
 		var body NotifyBody //create a struct to hold the request body
 
@@ -78,5 +98,4 @@ func (n *ChordNode) handleRPC(req RPCRequest) RPCResponse { //called after a req
 	default:
 		return RPCResponse{OK: false, Error: "unknown rpc type"} // reject unknown requests safely
 	}
-
 }
