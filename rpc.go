@@ -1,34 +1,41 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
 
+// --------------- Incomming ----------------
+
 func (n *Node) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	fmt.Println("Incoming connection from:", conn.RemoteAddr())
 
-	buffer := make([]byte, 1024)
-	read, err := conn.Read(buffer)
-
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Println("Error reading from connection:", err)
 		return
 	}
 
-	msg := strings.TrimSpace(string(buffer[:read]))
-	parts := strings.Split(msg, "")
+	msg := strings.TrimSpace(line)
+	parts := strings.Fields(msg)
+	if len(parts) == 0 {
+		fmt.Println("Empty command received")
+		return
+	}
+
 	cmd := parts[0]
 
 	switch cmd {
-	case "FINDSUCCESSOR":
-		n.rpcFindSuccessor(conn, parts)
-	case "GETPREDECESSOR":
-		n.rpcGetPredecessor(conn)
+	case "FINDSUCC":
+		n.rpcFindSucc(conn, parts)
+	case "GETPRED":
+		n.rpcGetPred(conn)
 
 	case "NOTIFY":
 		n.rpcNotify(conn, parts)
@@ -42,26 +49,33 @@ func (n *Node) handleConnection(conn net.Conn) {
 
 }
 
-func (n *Node) rpcFindSuccessor(conn net.Conn, parts []string) {
+// Handlers server side
+
+func (n *Node) rpcFindSucc(conn net.Conn, parts []string) {
 	if len(parts) != 2 {
-		fmt.Println("Invalid FINDSUCCESSOR command")
+		fmt.Println("Invalid FINDSUCC command")
 		return
 	}
 
-	id := parts[1]
-	successor := n.FindSuccessor(id)
+	id, err := parseHexID(parts[1])
+	if err != nil {
+		fmt.Println("Invalid ID in FINDSUCC command:", err)
+		return
+	}
 
-	fmt.Fprintf(conn, "NODE %s %s %d\n", successor.ID, successor.IP, successor.Port)
+	succ := n.FindSucc(id)
+
+	fmt.Fprintf(conn, "NODE %s %s %d\n", idToHex(succ.ID), succ.IP, succ.Port)
 }
 
-func (n *Node) rpcGetPredecessor(conn net.Conn) {
+func (n *Node) rpcGetPred(conn net.Conn) {
 	if n.Predecessor == nil {
 		fmt.Fprintf(conn, "NONE\n")
 		return
 	}
 
 	p := n.Predecessor
-	fmt.Fprintf(conn, "NODE %s %s %d\n", p.ID, p.IP, p.Port)
+	fmt.Fprintf(conn, "NODE %s %s %d\n", idToHex(p.ID), p.IP, p.Port)
 }
 
 func (n *Node) rpcNotify(conn net.Conn, parts []string) {
@@ -70,7 +84,12 @@ func (n *Node) rpcNotify(conn net.Conn, parts []string) {
 		return
 	}
 
-	id := parts[1]
+	id, err := parseHexID(parts[1])
+	if err != nil {
+		fmt.Fprintf(conn, "ERR: Bad ID in NOTIFY\n")
+		return
+	}
+
 	ip := parts[2]
 	port, _ := strconv.Atoi(parts[3])
 
@@ -82,8 +101,7 @@ func (n *Node) rpcNotify(conn net.Conn, parts []string) {
 	}
 
 	n.Notify(candidate)
-
-	fmt.Fprintf(conn, "OK\n")
+	fmt.Fprintf(conn, "OK, Notification sent\n")
 }
 
 func (n *Node) rpcClosest(conn net.Conn, parts []string) {
@@ -92,13 +110,19 @@ func (n *Node) rpcClosest(conn net.Conn, parts []string) {
 		return
 	}
 
-	id := parts[1]
+	id, err := parseHexID(parts[1])
+	if err != nil {
+		fmt.Fprintf(conn, "ERR Bad ID in CLOSEST\n")
+		return
+	}
 	finger := n.ClosestPrecedingFinger(id)
 
-	fmt.Fprintf(conn, "NODE %s %s %d\n", finger.ID, finger.IP, finger.Port)
+	fmt.Fprintf(conn, "NODE %s %s %d\n", idToHex(finger.ID), finger.IP, finger.Port)
 }
 
-func remoteFindSuccessor(target *RemoteNode, id string) *RemoteNode {
+// --------------- Outgoing ----------------
+
+func remoteFindsucc(target *RemoteNode, id string) *RemoteNode {
 	conn, err := net.Dial("tcp", target.Address)
 	if err != nil {
 		return nil
@@ -106,8 +130,8 @@ func remoteFindSuccessor(target *RemoteNode, id string) *RemoteNode {
 	defer conn.Close()
 
 	fmt.Fprintf(conn, "FINDSUCC %s\n", id)
-
 	return readNodeResponse(conn)
+
 }
 
 func remoteGetPredecessor(target *RemoteNode) *RemoteNode {
@@ -115,7 +139,6 @@ func remoteGetPredecessor(target *RemoteNode) *RemoteNode {
 	if err != nil {
 		return nil
 	}
-
 	defer conn.Close()
 
 	fmt.Fprintf(conn, "GETPREDECESSOR\n")
@@ -123,19 +146,49 @@ func remoteGetPredecessor(target *RemoteNode) *RemoteNode {
 	return readNodeResponse(conn)
 }
 
-func (n *Node) rpcNotify(conn net.conn, parts []string) {
-	id := parts[1]
+func remoteClosestPreceedingFinger(target *RemoteNode, id string) *RemoteNode {
+	conn, err := net.Dial("tcp", target.Address)
+	if err != nil {
+		return nil
+	}
+
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CLOSEST %s\n", id)
+
+	return readNodeResponse(conn)
+}
+
+// Parse node responses
+
+func readNodeResponse(conn net.Conn) *RemoteNode {
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return nil
+	}
+
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) == 1 && parts[0] == "NONE" {
+		return nil
+	}
+
+	if len(parts) != 4 || parts[0] != "NODE" {
+		return nil
+	}
+
+	id, err := parseHexID(parts[1])
+
+	if err != nil {
+		return nil
+	}
+
 	ip := parts[2]
 	port, _ := strconv.Atoi(parts[3])
 
-	candidate := &RemoteNode{
+	return &RemoteNode{
 		ID:      id,
 		IP:      ip,
 		Port:    port,
 		Address: fmt.Sprintf("%s:%d", ip, port),
 	}
-
-	n.Notify(candidate)
-
-	fmt.Fprintf(conn, "OK\n")
 }

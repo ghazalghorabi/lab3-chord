@@ -5,18 +5,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 )
 
 type RemoteNode struct {
-	ID      string
+	ID      *big.Int
 	IP      string
 	Port    int
 	Address string
 }
 
 type Node struct {
-	ID      string
+	ID      *big.Int
 	IP      string
 	Port    int
 	Address string
@@ -30,9 +31,56 @@ type Node struct {
 	Args Arguments
 }
 
-func computeID(address string) string {
-	raw := sha1.Sum([]byte(address))
-	return hex.EncodeToString(raw[:])
+func hashString(s string) *big.Int {
+	h := sha1.New()
+	h.Write([]byte(s))
+	hashBytes := h.Sum(nil)
+
+	hashInt := new(big.Int).SetBytes(hashBytes)
+	return hashInt
+}
+
+func parseHexID(hexStr string) (*big.Int, error) {
+	bytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, err
+	}
+
+	id := new(big.Int).SetBytes(bytes)
+	return id, nil
+}
+
+// Helper to print ID nicely
+func idToHex(id *big.Int) string {
+	return fmt.Sprintf("%040x", id)
+}
+
+func inInterval(x, a, b *big.Int, inclusiveEnd bool) bool {
+	mod := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
+
+	xN := new(big.Int).Mod(x, mod)
+	aN := new(big.Int).Mod(a, mod)
+	bN := new(big.Int).Mod(b, mod)
+
+	// Normal interval where a<b
+	if aN.Cmp(bN) < 0 {
+		if inclusiveEnd {
+			return xN.Cmp(aN) > 0 && xN.Cmp(bN) <= 0
+		}
+
+		return xN.Cmp(aN) > 0 && xN.Cmp(bN) < 0
+	}
+
+	//wrap around
+	if aN.Cmp(bN) > 0 {
+		if inclusiveEnd {
+			return xN.Cmp(aN) > 0 || xN.Cmp(bN) <= 0
+		}
+
+		return xN.Cmp(aN) > 0 || xN.Cmp(bN) < 0
+	}
+
+	return xN.Cmp(aN) != 0
 }
 
 func NewNode(args Arguments) *Node {
@@ -45,10 +93,17 @@ func NewNode(args Arguments) *Node {
 	}
 
 	if args.OverrideID != "" {
-		n.ID = args.OverrideID
+		id, err := parseHexID(args.OverrideID)
+		if err != nil {
+			log.Fatal("Invalid OverrideID:", err)
+		}
+		n.ID = id
 	} else {
-		n.ID = computeID(n.Address)
+		n.ID = hashString(n.Address)
 	}
+
+	n.FingerTable = make([]*RemoteNode, 160)
+	n.SuccessorList = make([]*RemoteNode, 5)
 
 	return n
 }
@@ -87,36 +142,55 @@ func (n *Node) Listen() {
 	}
 }
 
-func (n *Node) handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	fmt.Println("Incoming connection from:", conn.RemoteAddr())
-
-	// Temporary: read whatever they send but ignore it
-	buf := make([]byte, 1024)
-	conn.Read(buf)
-
-	// Temporary: just send back pong
-	conn.Write([]byte("pong"))
-}
-
 func (n *Node) JoinRing(joinIP string, joinPort int) {
-	addr := fmt.Sprintf("%s:%d", joinIP, joinPort)
-	fmt.Println("Trying: joining ring via node at", addr)
+	target := &RemoteNode{
+		IP:      joinIP,
+		Port:    joinPort,
+		Address: fmt.Sprintf("%s:%d", joinIP, joinPort),
+	}
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		fmt.Println("Connect fialed:", err)
+	succ := remoteFindSucc(target, idToHex(n.ID))
+	if succ == nil {
+		fmt.Println("Join failed: can't contact node ")
 		return
 	}
 
-	defer conn.Close()
+	n.Successor = succ
+	n.Predecessor = nil
 
-	conn.Write([]byte("ping"))
+}
 
-	buf := make([]byte, 1024)
-	nBytes, _ := conn.Read(buf)
+func (n *Node) ClosestPrecedingFinger(id *big.Int) *RemoteNode {
+	for i := len(n.FingerTable) - 1; i >= 0; i-- {
+		f := n.FingerTable[i]
+		if f != nil && inInterval(f.ID, n.ID, id, false) {
+			return f
+		}
+	}
+	return &RemoteNode{ID: n.ID, IP: n.IP, Port: n.Port, Address: n.Address}
+}
 
-	fmt.Println("Received Reply", string(buf[:nBytes]))
+func (n *Node) Notify(candidate *RemoteNode) {
+	if n.Predecessor == nil {
+		n.Predecessor = candidate
+		return
+	}
 
+	if inInterval(candidate.ID, n.Predecessor.ID, n.ID, false) {
+		n.Predecessor = candidate
+	}
+}
+
+func (n *Node) FindSucc(id *big.Int) *RemoteNode {
+	if n.Successor != nil && inInterval(id, n.ID, n.Successor.ID, true) {
+		return n.Successor
+	}
+
+	cpf := n.ClosestPrecedingFinger(id)
+
+	if cpf.Address == n.Address {
+		return n.Successor
+	}
+
+	return remoteFindsucc(cpf, idToHex(id))
 }
