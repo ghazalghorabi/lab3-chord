@@ -16,20 +16,17 @@ import (
 	"time"
 )
 
-const mBits = 160 // size of identifier space (SHA1 → 160 bits)
+const mBits = 160
 const fingerSize = 32
 
-// NodeID is just a big integer
 type NodeID = big.Int
 
-// NodeInfo holds basic info about a node
 type NodeInfo struct {
 	ID   *NodeID
 	IP   string
 	Port int
 }
 
-// Wire (JSON) representation
 type NodeInfoWire struct {
 	ID   string `json:"id"`
 	IP   string `json:"ip"`
@@ -51,7 +48,6 @@ type RPCResponse struct {
 	Error  string      `json:"error,omitempty"`
 }
 
-// ChordNode holds all state for our node (we'll fill it later)
 type ChordNode struct {
 	mu          sync.Mutex
 	Self        NodeInfo
@@ -59,20 +55,17 @@ type ChordNode struct {
 	Successors  []NodeInfo
 	Fingers     []NodeInfo
 	nextFinger  int
-	Files       map[string]FileRecord // key = hex-encoded ID
+	Files       map[string]FileRecord
 }
 
-// hashStringToID takes a string and returns a 160-bit ID (SHA1)
 func hashStringToID(s string) *NodeID {
-	h := sha1.Sum([]byte(s)) // 20 bytes
+	h := sha1.Sum([]byte(s))
 	n := new(big.Int)
 	n.SetBytes(h[:])
 	return n
 }
 
-// idToHex converts an ID to a 40-char hex string
 func idToHex(id *NodeID) string {
-	// Big int to bytes → hex
 	return fmt.Sprintf("%040x", id)
 }
 
@@ -96,7 +89,6 @@ func fromWire(w NodeInfoWire) *NodeInfo {
 	}
 }
 
-// parseHexToID parses a 40-hex-digit string into an ID
 func parseHexToID(s string) (*NodeID, error) {
 	b, err := hex.DecodeString(s)
 	if err != nil {
@@ -149,6 +141,9 @@ func (n *ChordNode) PrintState() {
 
 	fmt.Println("Finger table:")
 	for i, f := range n.Fingers {
+		if idToHex(f.ID) == idToHex(n.Self.ID) {
+			continue
+		}
 		fmt.Printf("  [%d] id=%s ip=%s port=%d\n",
 			i, idToHex(f.ID), f.IP, f.Port)
 	}
@@ -162,10 +157,9 @@ func (n *ChordNode) PrintState() {
 		}
 	}
 
-	fmt.Println("==================")
+	fmt.Println("=====================")
 }
 
-// handleConnection handles one incoming TCP connection from another node or client.
 func (n *ChordNode) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -246,7 +240,6 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		succ := n.Successors[0]
 		n.mu.Unlock()
 
-		// If id ∈ (self, successor], successor is the answer
 		if inInterval(id, self.ID, succ.ID, true) {
 			enc.Encode(RPCResponse{Result: toWire(succ)})
 			return
@@ -254,7 +247,6 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 
 		next := n.closestPrecedingFinger(id)
 
-		// CRITICAL FIX: don't return self forever
 		if next.ID.Cmp(self.ID) == 0 {
 			enc.Encode(RPCResponse{Result: toWire(succ)})
 			return
@@ -356,7 +348,6 @@ func (n *ChordNode) stabilize() {
 	succ := n.Successors[0]
 	n.mu.Unlock()
 
-	// 1. Check successor liveness WITHOUT holding lock
 	if err := tryPing(succ); err != nil {
 		n.mu.Lock()
 		for i := 0; i < len(n.Successors)-1; i++ {
@@ -367,7 +358,6 @@ func (n *ChordNode) stabilize() {
 		return
 	}
 
-	// 2. Ask successor for its predecessor
 	x := rpcGetPredecessor(succ)
 	if x != nil {
 		n.mu.Lock()
@@ -391,7 +381,6 @@ func (n *ChordNode) stabilize() {
 		n.mu.Unlock()
 	}
 
-	// 4. Notify successor
 	n.mu.Lock()
 	succ = n.Successors[0]
 	n.mu.Unlock()
@@ -421,7 +410,7 @@ func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
 		n.stabilize()
-		fmt.Println("[stabilize] done")
+		//fmt.Println("[stabilize] done")
 	}
 }
 
@@ -450,7 +439,7 @@ func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
 		n.checkPredecessor()
-		fmt.Println("[checkPredecessor] done")
+		//fmt.Println("[checkPredecessor] done")
 	}
 }
 
@@ -476,7 +465,7 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
 		n.fixFingers()
-		fmt.Println("[fixFingers] done")
+		//fmt.Println("[fixFingers] done")
 	}
 }
 
@@ -487,7 +476,6 @@ func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	return rpcLookupSuccessor(start, id)
 }
 
-// inInterval returns true if x ∈ (a, b] or (a, b), depending on inclusiveEnd.
 func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	mod := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
 
@@ -495,17 +483,13 @@ func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	aN := new(big.Int).Mod(a, mod)
 	bN := new(big.Int).Mod(b, mod)
 
-	// Case 1: normal order (a < b)
 	if aN.Cmp(bN) < 0 {
 		if inclusiveEnd {
-			// (a, b]
 			return xN.Cmp(aN) > 0 && xN.Cmp(bN) <= 0
 		}
-		// (a, b)
 		return xN.Cmp(aN) > 0 && xN.Cmp(bN) < 0
 	}
 
-	// Case 2: wrap-around (a > b)
 	if inclusiveEnd {
 		return xN.Cmp(aN) > 0 || xN.Cmp(bN) <= 0
 	}
@@ -519,7 +503,7 @@ func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 	for i := len(n.Fingers) - 1; i >= 0; i-- {
 		f := n.Fingers[i]
 		if f.ID != nil && inInterval(f.ID, n.Self.ID, target, false) {
-			out := f // return a copy
+			out := f
 			return &out
 		}
 	}
@@ -786,7 +770,6 @@ func (n *ChordNode) migrateKeysFromSuccessor() {
 		return
 	}
 
-	// Store locally
 	var keyList []string
 	n.mu.Lock()
 	for k, v := range keys {
@@ -820,7 +803,6 @@ func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 			return nil
 		}
 
-		// If we don't know cur.ID (bootstrap), just follow resp as next hop
 		if cur.ID == nil {
 			cur = *resp
 			continue
@@ -836,7 +818,6 @@ func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 }
 
 func main() {
-	// Define flags
 	ip := flag.String("a", "", "IP address to bind and advertise")
 	port := flag.Int("p", 0, "Port to bind and listen on")
 
@@ -850,10 +831,8 @@ func main() {
 	r := flag.Int("r", -1, "Number of successors to maintain")
 	manualID := flag.String("i", "", "Optional manual node ID (40 hex chars)")
 
-	// Parse all flags from command line
 	flag.Parse()
 
-	// Validate required flags
 	if *ip == "" || *port == 0 {
 		fmt.Println("Error: -a <ip> and -p <port> are required.")
 		os.Exit(1)
@@ -869,7 +848,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate join flags
 	joining := false
 	if *joinIP != "" || *joinPort != 0 {
 		if *joinIP == "" || *joinPort == 0 {
@@ -879,7 +857,6 @@ func main() {
 		joining = true
 	}
 
-	// Print summary so we can see it's correct
 	fmt.Println("=== Chord Node Configuration ===")
 	fmt.Println("IP:", *ip)
 	fmt.Println("Port:", *port)
@@ -902,7 +879,6 @@ func main() {
 
 	fmt.Println("================================")
 
-	// Compute our node ID
 	var myID *NodeID
 	if *manualID != "" {
 		if len(*manualID) != 40 {
@@ -919,24 +895,20 @@ func main() {
 		id, _ := parseHexToID(*manualID)
 		myID = id
 	} else {
-		// default: hash "ip:port"
 		myID = hashStringToID(fmt.Sprintf("%s:%d", *ip, *port))
 	}
 
 	fmt.Println("Computed node ID:", idToHex(myID))
 
-	// Create basic node struct (we'll extend this later)
 	selfInfo := NodeInfo{
 		ID:   myID,
 		IP:   *ip,
 		Port: *port,
 	}
 	node := newChordNode(selfInfo, *r)
-	// If joining, contact bootstrap node to find our successor
 	if joining {
-		// Contact bootstrap node
 		bootstrap := NodeInfo{
-			ID:   nil, // we don't know its ID yet
+			ID:   nil,
 			IP:   *joinIP,
 			Port: *joinPort,
 		}
@@ -964,7 +936,6 @@ func main() {
 	fmt.Println("Node created. Initial state:")
 	node.PrintState()
 
-	// Start TCP server in the background
 	go func() {
 		if err := node.ListenAndServe(); err != nil {
 			fmt.Println("Listen error:", err)
@@ -976,7 +947,6 @@ func main() {
 	go node.fixFingersLoop(time.Duration(*tff) * time.Millisecond)
 	go node.checkPredecessorLoop(time.Duration(*tcp) * time.Millisecond)
 
-	// Command loop: read from stdin
 	fmt.Println("Ready for commands. Type 'PrintState' or 'quit'.")
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -1020,7 +990,6 @@ func main() {
 			}
 
 			if succ.ID.Cmp(node.Self.ID) == 0 {
-				// Store locally
 				node.mu.Lock()
 				node.Files[keyHex] = FileRecord{Name: name, Content: string(data)}
 				node.mu.Unlock()
