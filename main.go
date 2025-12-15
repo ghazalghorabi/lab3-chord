@@ -2,7 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -301,7 +306,16 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 // ListenAndServe starts a TCP server for this node and handles requests forever.
 func (n *ChordNode) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port)
-	ln, err := net.Listen("tcp", addr)
+
+	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	if err != nil {
+		return fmt.Errorf("failed to load TLS keypair: %w", err)
+	}
+	config := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	ln, err := tls.Listen("tcp", addr, config)
 	if err != nil {
 		return err
 	}
@@ -344,9 +358,19 @@ func (n *ChordNode) stabilize() {
 		}
 	}
 
+	// Re-replicate all files to updated successors
+	for key, rec := range n.Files {
+		for i := 1; i < len(n.Successors); i++ {
+			s := n.Successors[i]
+			rpcPutFile(s, key, rec.Name, rec.Content)
+		}
+	}
+
 	// Notify successor
 	addr := fmt.Sprintf("%s:%d", n.Successors[0].IP, n.Successors[0].Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err == nil {
 		fmt.Fprintf(conn, "NOTIFY %s %s %d\n",
 			idToHex(n.Self.ID), n.Self.IP, n.Self.Port)
@@ -368,7 +392,9 @@ func (n *ChordNode) checkPredecessor() {
 	}
 
 	addr := fmt.Sprintf("%s:%d", n.Predecessor.IP, n.Predecessor.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		// predecessor failed
 		n.Predecessor = nil
@@ -411,34 +437,34 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	// Start at ourselves
-	cur := n.Self
+	cur := n.Successors[0]
 
-	for {
-		// Ask the current node who its successor is
+	for hops := 0; hops < 32; hops++ {
 		succ := rpcGetSuccessor(cur)
 		if succ == nil {
 			return nil
 		}
 
-		// If the ID is between cur and succ → answer found
+		// If ID is between cur and succ → answer found
 		if inInterval(id, cur.ID, succ.ID, true) {
 			return succ
 		}
 
-		// Ask THAT node (not us!) for its closest preceding finger
+		// Ask that node for its closest preceding finger
 		cpf := rpcClosestPrecedingFinger(cur, id)
 		if cpf == nil {
 			return succ
 		}
 
-		// If no progress can be made, give up and return successor
+		// No progress → return successor
 		if cpf.ID.Cmp(cur.ID) == 0 {
 			return succ
 		}
 
-		// Hop to next node
 		cur = *cpf
 	}
+	return rpcGetSuccessor(n.Successors[0])
+
 }
 
 // inInterval returns true if x ∈ (a, b] or (a, b), depending on inclusiveEnd.
@@ -471,9 +497,12 @@ func (n *ChordNode) closestPrecedingFinger(target *NodeID) NodeInfo {
 	// We scan backwards from the largest finger index.
 	for i := len(n.Fingers) - 1; i >= 0; i-- {
 		finger := n.Fingers[i]
-		if finger.ID != nil && inInterval(finger.ID, n.Self.ID, target, false) {
+		if finger.ID != nil &&
+			finger.ID.Cmp(n.Self.ID) != 0 &&
+			inInterval(finger.ID, n.Self.ID, target, false) {
 			return finger
 		}
+
 	}
 	// If none match, return ourselves.
 	return n.Self
@@ -481,7 +510,9 @@ func (n *ChordNode) closestPrecedingFinger(target *NodeID) NodeInfo {
 
 func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -522,7 +553,9 @@ func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 
 func rpcClosestPrecedingFinger(target NodeInfo, id *NodeID) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -552,7 +585,9 @@ func rpcClosestPrecedingFinger(target NodeInfo, id *NodeID) *NodeInfo {
 
 func rpcGetSuccessor(target NodeInfo) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -587,7 +622,9 @@ func rpcGetSuccessor(target NodeInfo) *NodeInfo {
 
 func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -622,7 +659,9 @@ func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 }
 func rpcPutFile(target NodeInfo, key, name, content string) bool {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return false
 	}
@@ -636,7 +675,9 @@ func rpcPutFile(target NodeInfo, key, name, content string) bool {
 }
 func rpcGetFile(target NodeInfo, key string) *FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -677,7 +718,9 @@ func rpcGetFile(target NodeInfo, key string) *FileRecord {
 
 func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -731,7 +774,9 @@ func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord 
 
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return nil
 	}
@@ -786,13 +831,62 @@ func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 
 func tryPing(n NodeInfo) error {
 	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
-	conn, err := net.Dial("tcp", addr)
+	config := &tls.Config{InsecureSkipVerify: true}
+	conn, err := tls.Dial("tcp", addr, config)
+
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 	fmt.Fprintln(conn, "PING")
 	return nil
+}
+
+var secretKey = []byte("this-is-32-bytes-long-key-123456") // 32 bytes for AES-256
+
+func Encrypt(plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(secretKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	// Seal appends ciphertext to nonce; we prefix nonce in our stored buffer.
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
+}
+
+func Decrypt(ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(secretKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce := ciphertext[:nonceSize]
+	data := ciphertext[nonceSize:]
+
+	plaintext, err := gcm.Open(nil, nonce, data, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }
 
 func main() {
@@ -902,23 +996,21 @@ func main() {
 
 		node.Successors[0] = *succ
 		// Attempt immediate key migration from successor
-		succLow := node.Predecessor
-		if succLow == nil {
-			// if we don't know predecessor yet, assume full interval from successor->self
-			succLow = &NodeInfo{ID: succ.ID}
-		}
-
-		lowHex := idToHex(succLow.ID)
-		highHex := idToHex(myID)
+		// Correct interval: (successor.ID, self.ID]
+		lowHex := idToHex(succ.ID) // successor.ID
+		highHex := idToHex(myID)   // self.ID
 
 		files := rpcGetRange(*succ, lowHex, highHex)
+
 		if files != nil {
 			for k, rec := range files {
-				node.Files[k] = rec
+				node.Files[k] = rec // rec.Content is already base64 ciphertext from successor
 			}
-		}
 
-		fmt.Println("Migrated", len(files), "keys from successor.")
+			fmt.Println("Migrated", len(files), "keys from successor.")
+		} else {
+			fmt.Println("Migrated 0 keys from successor.")
+		}
 
 		fmt.Println("Joined ring. My successor is:", idToHex(succ.ID), succ.IP, succ.Port)
 	} else {
@@ -969,7 +1061,14 @@ func main() {
 			path := parts[1]
 			data, err := os.ReadFile(path)
 			if err != nil {
-				fmt.Println("Error:", err)
+				fmt.Println("Error reading file:", err)
+				continue
+			}
+
+			// Encrypt BEFORE storing or sending
+			ciphertext, err := Encrypt(data)
+			if err != nil {
+				fmt.Println("Encryption failed:", err)
 				continue
 			}
 
@@ -982,22 +1081,27 @@ func main() {
 				fmt.Println("Error: successor lookup failed")
 				continue
 			}
+			encoded := base64.StdEncoding.EncodeToString(ciphertext)
 
 			if succ.ID.Cmp(node.Self.ID) == 0 {
-				// Store locally
-				node.Files[keyHex] = FileRecord{Name: name, Content: string(data)}
-				fmt.Println("Stored locally")
+				node.Files[keyHex] = FileRecord{
+					Name:    name,
+					Content: encoded,
+				}
+				fmt.Println("Stored locally (encrypted)")
 			} else {
-				ok := rpcPutFile(*succ, keyHex, name, string(data))
+				ok := rpcPutFile(*succ, keyHex, name, encoded)
 				if ok {
-					fmt.Println("Stored on node", succ.IP, succ.Port)
+					fmt.Println("Stored on node", succ.IP, succ.Port, "(encrypted)")
 				} else {
 					fmt.Println("Remote store failed")
 				}
 			}
+
+			// Replicate encrypted data to successors
 			for i := 1; i < len(node.Successors); i++ {
-				succ := node.Successors[i]
-				rpcPutFile(succ, keyHex, name, string(data))
+				s := node.Successors[i]
+				rpcPutFile(s, keyHex, name, encoded)
 			}
 
 		case "Lookup":
@@ -1019,21 +1123,38 @@ func main() {
 			fmt.Printf("Owner: %s %s %d\n",
 				idToHex(succ.ID), succ.IP, succ.Port)
 
+			var rec *FileRecord
+
 			if succ.ID.Cmp(node.Self.ID) == 0 {
-				rec, ok := node.Files[keyHex]
+				r, ok := node.Files[keyHex]
 				if !ok {
 					fmt.Println("File not found locally")
 					continue
 				}
-				fmt.Println(rec.Content)
+				rec = &r
 			} else {
-				rec := rpcGetFile(*succ, keyHex)
-				if rec == nil {
+				r := rpcGetFile(*succ, keyHex)
+				if r == nil {
 					fmt.Println("File not found on remote node")
 					continue
 				}
-				fmt.Println(rec.Content)
+				rec = r
 			}
+
+			ciphertext, err := base64.StdEncoding.DecodeString(rec.Content)
+			if err != nil {
+				fmt.Println("Base64 decode failed:", err)
+				continue
+			}
+
+			plaintext, err := Decrypt(ciphertext)
+
+			if err != nil {
+				fmt.Println("Decryption failed:", err)
+				continue
+			}
+
+			fmt.Println(string(plaintext))
 
 		default:
 			fmt.Println("Unknown command. Use: PrintState, StoreFile, Lookup, quit")
