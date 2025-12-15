@@ -11,13 +11,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const mBits = 160 // size of identifier space (SHA1 → 160 bits)
+const fingerSize = 32
 
 // NodeID is just a big integer
 type NodeID = big.Int
@@ -112,14 +112,15 @@ func newChordNode(self NodeInfo, r int) *ChordNode {
 		Self:        self,
 		Predecessor: nil,
 		Successors:  make([]NodeInfo, r),
-		Fingers:     make([]NodeInfo, mBits),
+		Fingers:     make([]NodeInfo, fingerSize),
+		nextFinger:  -1,
 		Files:       make(map[string]FileRecord),
 	}
 
 	for i := 0; i < r; i++ {
 		n.Successors[i] = self
 	}
-	for i := 0; i < mBits; i++ {
+	for i := 0; i < fingerSize; i++ {
 		n.Fingers[i] = self
 	}
 
@@ -210,8 +211,12 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		}
 
 		n.mu.Lock()
-		shouldUpdate := n.Predecessor == nil ||
-			inInterval(p.ID, n.Predecessor.ID, n.Self.ID, false)
+		remoteIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+
+		shouldUpdate := (n.Predecessor == nil ||
+			inInterval(p.ID, n.Predecessor.ID, n.Self.ID, false)) &&
+			remoteIP == p.IP
+
 		if shouldUpdate {
 			n.Predecessor = p
 		}
@@ -234,14 +239,28 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 	case "FindSuccessor":
 		var p struct{ ID string }
 		json.Unmarshal(req.Params, &p)
-
 		id, _ := parseHexToID(p.ID)
-		succ := n.findSuccessor(id)
-		if succ == nil {
-			enc.Encode(RPCResponse{Result: nil})
+
+		n.mu.Lock()
+		self := n.Self
+		succ := n.Successors[0]
+		n.mu.Unlock()
+
+		// If id ∈ (self, successor], successor is the answer
+		if inInterval(id, self.ID, succ.ID, true) {
+			enc.Encode(RPCResponse{Result: toWire(succ)})
 			return
 		}
-		enc.Encode(RPCResponse{Result: toWire(*succ)})
+
+		next := n.closestPrecedingFinger(id)
+
+		// CRITICAL FIX: don't return self forever
+		if next.ID.Cmp(self.ID) == 0 {
+			enc.Encode(RPCResponse{Result: toWire(succ)})
+			return
+		}
+
+		enc.Encode(RPCResponse{Result: toWire(*next)})
 
 	case "PutFile":
 		var p struct {
@@ -309,10 +328,21 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		json.Unmarshal(req.Params, &p)
 
 		n.mu.Lock()
-		for _, k := range p.Keys {
-			delete(n.Files, k)
+		allowed := n.Predecessor != nil &&
+			n.Predecessor.IP == conn.RemoteAddr().(*net.TCPAddr).IP.String() &&
+			n.Predecessor.Port == conn.RemoteAddr().(*net.TCPAddr).Port
+
+		if allowed {
+			for _, k := range p.Keys {
+				delete(n.Files, k)
+			}
 		}
 		n.mu.Unlock()
+
+		if !allowed {
+			enc.Encode(RPCResponse{Error: "unauthorized"})
+			return
+		}
 
 		enc.Encode(RPCResponse{Result: "OK"})
 
@@ -347,8 +377,12 @@ func (n *ChordNode) stabilize() {
 		n.mu.Unlock()
 	}
 
-	// 3. Refresh successor list
+	n.mu.Lock()
+	succ = n.Successors[0]
+	n.mu.Unlock()
+
 	other := rpcGetSuccessorList(succ)
+
 	if other != nil {
 		n.mu.Lock()
 		for i := 1; i < len(n.Successors) && i-1 < len(other); i++ {
@@ -362,10 +396,13 @@ func (n *ChordNode) stabilize() {
 	succ = n.Successors[0]
 	n.mu.Unlock()
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", succ.IP, succ.Port))
+	addr := fmt.Sprintf("%s:%d", succ.IP, succ.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return
 	}
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+
 	defer conn.Close()
 
 	enc := json.NewEncoder(conn)
@@ -398,13 +435,14 @@ func (n *ChordNode) checkPredecessor() {
 	}
 
 	addr := fmt.Sprintf("%s:%d", pred.IP, pred.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		n.mu.Lock()
 		n.Predecessor = nil
 		n.mu.Unlock()
 		return
 	}
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 	conn.Close()
 }
 
@@ -418,7 +456,7 @@ func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 
 func (n *ChordNode) fixFingers() {
 	n.mu.Lock()
-	n.nextFinger = (n.nextFinger + 1) % mBits
+	n.nextFinger = (n.nextFinger + 1) % fingerSize
 
 	start := new(big.Int)
 	twoPow := new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(n.nextFinger)), nil)
@@ -444,36 +482,9 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	n.mu.Lock()
-	onlyNode := n.Successors[0].ID.Cmp(n.Self.ID) == 0
+	start := n.Self
 	n.mu.Unlock()
-
-	//Single-node ring shortcut
-	if onlyNode {
-		return &n.Self
-	}
-
-	cur := n.Self
-	var lastSucc *NodeInfo
-
-	for hops := 0; hops < mBits; hops++ {
-		succ := rpcGetSuccessor(cur)
-		if succ == nil {
-			return lastSucc
-		}
-		lastSucc = succ
-
-		if inInterval(id, cur.ID, succ.ID, true) {
-			return succ
-		}
-
-		cpf := rpcClosestPrecedingFinger(cur, id)
-		if cpf == nil || cpf.ID.Cmp(cur.ID) == 0 {
-			return succ
-		}
-
-		cur = *cpf
-	}
-	return lastSucc
+	return rpcLookupSuccessor(start, id)
 }
 
 // inInterval returns true if x ∈ (a, b] or (a, b), depending on inclusiveEnd.
@@ -501,23 +512,31 @@ func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	return xN.Cmp(aN) > 0 || xN.Cmp(bN) < 0
 }
 
-// closestPrecedingFinger returns the closest finger preceding the target ID.
 func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	for i := len(n.Fingers) - 1; i >= 0; i-- {
-		if n.Fingers[i].ID != nil &&
-			inInterval(n.Fingers[i].ID, n.Self.ID, target, false) {
-			return &n.Fingers[i]
+		f := n.Fingers[i]
+		if f.ID != nil && inInterval(f.ID, n.Self.ID, target, false) {
+			out := f // return a copy
+			return &out
 		}
 	}
-	return &n.Self
+
+	out := n.Self
+	return &out
 }
 
 func rpcGetPredecessor(target NodeInfo) *NodeInfo {
-	conn, err := net.Dial("tcp", target.IP+":"+strconv.Itoa(target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -542,73 +561,14 @@ func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 
 }
 
-func rpcClosestPrecedingFinger(target NodeInfo, id *NodeID) *NodeInfo {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-
-	enc := json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
-
-	enc.Encode(RPCRequest{
-		Method: "ClosestPrecedingFinger",
-		Params: mustJSON(struct{ ID string }{idToHex(id)}),
-	})
-
-	var resp RPCResponse
-	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
-		return nil
-	}
-
-	b, _ := json.Marshal(resp.Result)
-	var pw NodeInfoWire
-	if err := json.Unmarshal(b, &pw); err != nil {
-		return nil
-	}
-	return fromWire(pw)
-
-}
-
-func rpcGetSuccessor(target NodeInfo) *NodeInfo {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-
-	enc := json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
-
-	// Send request
-	enc.Encode(RPCRequest{
-		Method: "GetSuccessor",
-		Params: json.RawMessage(`{}`),
-	})
-
-	// Read response
-	var resp RPCResponse
-	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
-		return nil
-	}
-
-	// Decode result into NodeInfo
-	data, _ := json.Marshal(resp.Result)
-	var pw NodeInfoWire
-	if err := json.Unmarshal(data, &pw); err != nil {
-		return nil
-	}
-	return fromWire(pw)
-
-}
-
 func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -633,11 +593,14 @@ func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 }
 
 func rpcPutFile(target NodeInfo, key, name, content string) bool {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -664,11 +627,14 @@ func rpcPutFile(target NodeInfo, key, name, content string) bool {
 }
 
 func rpcGetFile(target NodeInfo, key string) *FileRecord {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -694,11 +660,14 @@ func rpcGetFile(target NodeInfo, key string) *FileRecord {
 }
 
 func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -730,11 +699,14 @@ func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord 
 }
 
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
+	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -767,11 +739,14 @@ func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 }
 
 func tryPing(n NodeInfo) error {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", n.IP, n.Port))
+	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
@@ -820,18 +795,44 @@ func (n *ChordNode) migrateKeysFromSuccessor() {
 	}
 	n.mu.Unlock()
 
-	// Tell successor to delete transferred keys
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", succ.IP, succ.Port))
+	addr := fmt.Sprintf("%s:%d", succ.IP, succ.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	enc := json.NewEncoder(conn)
 	enc.Encode(RPCRequest{
 		Method: "DeleteKeys",
 		Params: mustJSON(struct{ Keys []string }{keyList}),
 	})
+}
+
+func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
+	cur := start
+
+	for i := 0; i < mBits; i++ {
+		resp := rpcFindSuccessor(cur, id)
+		if resp == nil {
+			return nil
+		}
+
+		// If we don't know cur.ID (bootstrap), just follow resp as next hop
+		if cur.ID == nil {
+			cur = *resp
+			continue
+		}
+
+		if inInterval(id, cur.ID, resp.ID, true) {
+			return resp
+		}
+
+		cur = *resp
+	}
+	return nil
 }
 
 func main() {
@@ -904,11 +905,18 @@ func main() {
 	// Compute our node ID
 	var myID *NodeID
 	if *manualID != "" {
-		id, err := parseHexToID(*manualID)
-		if err != nil {
-			fmt.Println("Error: invalid manual ID:", err)
+		if len(*manualID) != 40 {
+			fmt.Println("Error: manual ID must be exactly 40 hex characters")
 			os.Exit(1)
 		}
+
+		_, err := hex.DecodeString(*manualID)
+		if err != nil {
+			fmt.Println("Error: manual ID must be hexadecimal")
+			os.Exit(1)
+		}
+
+		id, _ := parseHexToID(*manualID)
 		myID = id
 	} else {
 		// default: hash "ip:port"
@@ -933,13 +941,20 @@ func main() {
 			Port: *joinPort,
 		}
 
-		succ := rpcFindSuccessor(bootstrap, myID)
+		succ := rpcLookupSuccessor(bootstrap, myID)
 		if succ == nil {
 			fmt.Println("Join failed: could not find successor")
 			os.Exit(1)
 		}
 
-		node.Successors[0] = *succ
+		node.mu.Lock()
+		for i := range node.Successors {
+			node.Successors[i] = *succ
+		}
+		for i := range node.Fingers {
+			node.Fingers[i] = *succ
+		}
+		node.mu.Unlock()
 
 		fmt.Println("Joined ring. My successor is:", idToHex(succ.ID), succ.IP, succ.Port)
 	} else {
@@ -1006,7 +1021,9 @@ func main() {
 
 			if succ.ID.Cmp(node.Self.ID) == 0 {
 				// Store locally
+				node.mu.Lock()
 				node.Files[keyHex] = FileRecord{Name: name, Content: string(data)}
+				node.mu.Unlock()
 				fmt.Println("Stored locally")
 			} else {
 				ok := rpcPutFile(*succ, keyHex, name, string(data))
@@ -1037,7 +1054,9 @@ func main() {
 				idToHex(succ.ID), succ.IP, succ.Port)
 
 			if succ.ID.Cmp(node.Self.ID) == 0 {
+				node.mu.Lock()
 				rec, ok := node.Files[keyHex]
+				node.mu.Unlock()
 				if !ok {
 					fmt.Println("File not found locally")
 					continue
