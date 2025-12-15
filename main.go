@@ -4,15 +4,16 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,19 +29,37 @@ type NodeInfo struct {
 	Port int
 }
 
+// Wire (JSON) representation
+type NodeInfoWire struct {
+	ID   string `json:"id"`
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
+
 type FileRecord struct {
 	Name    string
 	Content string
 }
 
+type RPCRequest struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+type RPCResponse struct {
+	Result interface{} `json:"result,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
 // ChordNode holds all state for our node (we'll fill it later)
 type ChordNode struct {
+	mu          sync.Mutex
 	Self        NodeInfo
 	Predecessor *NodeInfo
 	Successors  []NodeInfo
 	Fingers     []NodeInfo
-
-	Files map[string]FileRecord // key = hex-encoded ID
+	nextFinger  int
+	Files       map[string]FileRecord // key = hex-encoded ID
 }
 
 // hashStringToID takes a string and returns a 160-bit ID (SHA1)
@@ -55,6 +74,26 @@ func hashStringToID(s string) *NodeID {
 func idToHex(id *NodeID) string {
 	// Big int to bytes → hex
 	return fmt.Sprintf("%040x", id)
+}
+
+func toWire(n NodeInfo) NodeInfoWire {
+	return NodeInfoWire{
+		ID:   idToHex(n.ID),
+		IP:   n.IP,
+		Port: n.Port,
+	}
+}
+
+func fromWire(w NodeInfoWire) *NodeInfo {
+	id, err := parseHexToID(w.ID)
+	if err != nil {
+		return nil
+	}
+	return &NodeInfo{
+		ID:   id,
+		IP:   w.IP,
+		Port: w.Port,
+	}
 }
 
 // parseHexToID parses a 40-hex-digit string into an ID
@@ -88,6 +127,8 @@ func newChordNode(self NodeInfo, r int) *ChordNode {
 }
 
 func (n *ChordNode) PrintState() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	fmt.Println("=== PrintState ===")
 	fmt.Printf("Self: id=%s ip=%s port=%d\n",
 		idToHex(n.Self.ID), n.Self.IP, n.Self.Port)
@@ -127,231 +168,216 @@ func (n *ChordNode) PrintState() {
 func (n *ChordNode) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
+	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
+
+	var req RPCRequest
+	if err := dec.Decode(&req); err != nil {
+		enc.Encode(RPCResponse{Error: "invalid request"})
 		return
 	}
-	line = strings.TrimSpace(line)
 
-	parts := strings.Fields(line)
-	cmd := parts[0]
+	switch req.Method {
 
-	switch cmd {
-	case "PING":
-		fmt.Fprintln(conn, "PONG")
+	case "Ping":
+		enc.Encode(RPCResponse{Result: "PONG"})
 
-	case "GETSUCC":
-		// Return our first successor, not ourselves
+	case "GetSuccessor":
+		n.mu.Lock()
 		succ := n.Successors[0]
-		fmt.Fprintf(conn, "%s %s %d\n", idToHex(succ.ID), succ.IP, succ.Port)
+		n.mu.Unlock()
+		enc.Encode(RPCResponse{Result: toWire(succ)})
 
-	case "GETPRED":
-		if n.Predecessor == nil {
-			fmt.Fprintln(conn, "NIL")
-		} else {
-			p := n.Predecessor
-			fmt.Fprintf(conn, "%s %s %d\n", idToHex(p.ID), p.IP, p.Port)
+	case "GetPredecessor":
+		n.mu.Lock()
+		pred := n.Predecessor
+		n.mu.Unlock()
+
+		if pred == nil {
+			enc.Encode(RPCResponse{Result: nil})
+			return
 		}
-	case "GETFILE":
-		// GETFILE <key>
-		if len(parts) != 2 {
-			fmt.Fprintln(conn, "ERR")
+		enc.Encode(RPCResponse{Result: toWire(*pred)})
+
+	case "Notify":
+		var pw NodeInfoWire
+		json.Unmarshal(req.Params, &pw)
+
+		p := fromWire(pw)
+		if p == nil {
+			enc.Encode(RPCResponse{Error: "bad node info"})
 			return
 		}
 
-		key := parts[1]
-		rec, ok := n.Files[key]
-		if !ok {
-			fmt.Fprintln(conn, "NIL")
-			return
+		n.mu.Lock()
+		shouldUpdate := n.Predecessor == nil ||
+			inInterval(p.ID, n.Predecessor.ID, n.Self.ID, false)
+		if shouldUpdate {
+			n.Predecessor = p
+		}
+		n.mu.Unlock()
+
+		if shouldUpdate {
+			n.migrateKeysFromSuccessor()
 		}
 
-		fmt.Fprintf(conn, "OK %s %d\n", rec.Name, len(rec.Content))
-		conn.Write([]byte(rec.Content))
+		enc.Encode(RPCResponse{Result: "OK"})
 
-	case "NOTIFY":
-		// NOTIFY <id> <ip> <port>
-		if len(parts) != 4 {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-		newID, err := parseHexToID(parts[1])
-		if err != nil {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-		portVal, _ := strconv.Atoi(parts[3])
-		newPred := &NodeInfo{ID: newID, IP: parts[2], Port: portVal}
+	case "ClosestPrecedingFinger":
+		var p struct{ ID string }
+		json.Unmarshal(req.Params, &p)
 
-		if n.Predecessor == nil || inInterval(newPred.ID, n.Predecessor.ID, n.Self.ID, false) {
-			n.Predecessor = newPred
-		}
-		fmt.Fprintln(conn, "OK")
+		id, _ := parseHexToID(p.ID)
+		f := n.closestPrecedingFinger(id)
+		enc.Encode(RPCResponse{Result: toWire(*f)})
 
-	case "CPF":
-		// CPF <id>
-		if len(parts) != 2 {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-		target, _ := parseHexToID(parts[1])
-		finger := n.closestPrecedingFinger(target)
-		fmt.Fprintf(conn, "%s %s %d\n", idToHex(finger.ID), finger.IP, finger.Port)
+	case "FindSuccessor":
+		var p struct{ ID string }
+		json.Unmarshal(req.Params, &p)
 
-	case "FINDSUCC":
-		if len(parts) != 2 {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-		target, _ := parseHexToID(parts[1])
-		succ := n.findSuccessor(target)
+		id, _ := parseHexToID(p.ID)
+		succ := n.findSuccessor(id)
 		if succ == nil {
-			fmt.Fprintln(conn, "ERR")
+			enc.Encode(RPCResponse{Result: nil})
 			return
 		}
-		fmt.Fprintf(conn, "%s %s %d\n", idToHex(succ.ID), succ.IP, succ.Port)
-	case "PUTFILE":
-		// PUTFILE <key> <name> <size>
-		if len(parts) != 4 {
-			fmt.Fprintln(conn, "ERR")
+		enc.Encode(RPCResponse{Result: toWire(*succ)})
+
+	case "PutFile":
+		var p struct {
+			Key     string
+			Name    string
+			Content string
+		}
+		json.Unmarshal(req.Params, &p)
+		n.mu.Lock()
+		n.Files[p.Key] = FileRecord{
+			Name:    p.Name,
+			Content: p.Content,
+		}
+		n.mu.Unlock()
+
+		enc.Encode(RPCResponse{Result: "OK"})
+
+	case "GetFile":
+		var p struct{ Key string }
+		json.Unmarshal(req.Params, &p)
+
+		n.mu.Lock()
+		rec, ok := n.Files[p.Key]
+		n.mu.Unlock()
+
+		if !ok {
+			enc.Encode(RPCResponse{Result: nil})
 			return
 		}
+		enc.Encode(RPCResponse{Result: rec})
 
-		keyHex := parts[1]
-		name := parts[2]
-		size, _ := strconv.Atoi(parts[3])
-
-		buf := make([]byte, size)
-		_, err := io.ReadFull(reader, buf)
-		if err != nil {
-			fmt.Fprintln(conn, "ERR")
-			return
+	case "GetRange":
+		var p struct {
+			Low  string
+			High string
 		}
+		json.Unmarshal(req.Params, &p)
 
-		n.Files[keyHex] = FileRecord{
-			Name:    name,
-			Content: string(buf),
-		}
-
-		fmt.Fprintln(conn, "OK")
-	case "GETSUCCLIST":
-		// Send our successor list length, then each successor on its own line
-		// First line: number of successors we will send
-		count := len(n.Successors)
-		fmt.Fprintln(conn, count)
-		for _, s := range n.Successors {
-			fmt.Fprintf(conn, "%s %s %d\n", idToHex(s.ID), s.IP, s.Port)
-		}
-	case "GETRANGE":
-		// GETRANGE <lowHex> <highHex>
-		if len(parts) != 3 {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-
-		lowHex := parts[1]
-		highHex := parts[2]
-
-		lowID, err1 := parseHexToID(lowHex)
-		highID, err2 := parseHexToID(highHex)
-		if err1 != nil || err2 != nil {
-			fmt.Fprintln(conn, "ERR")
-			return
-		}
-
-		// Collect matching keys
-		sendList := make([]FileRecord, 0)
-		sendKeys := make([]string, 0)
-
-		for keyHex, rec := range n.Files {
-			keyID, err := parseHexToID(keyHex)
-			if err != nil {
-				continue
-			}
-
-			if inInterval(keyID, lowID, highID, true) {
-				sendList = append(sendList, rec)
-				sendKeys = append(sendKeys, keyHex)
+		result := make(map[string]FileRecord)
+		n.mu.Lock()
+		for k, v := range n.Files {
+			kid, _ := parseHexToID(k)
+			low, _ := parseHexToID(p.Low)
+			high, _ := parseHexToID(p.High)
+			if inInterval(kid, low, high, true) {
+				result[k] = v
 			}
 		}
+		n.mu.Unlock()
+		enc.Encode(RPCResponse{Result: result})
 
-		// Send count
-		fmt.Fprintf(conn, "COUNT %d\n", len(sendList))
-
-		// Send each file (header + content)
-		for i := range sendList {
-			rec := sendList[i]
-			key := sendKeys[i]
-			fmt.Fprintf(conn, "%s %s %d\n", key, rec.Name, len(rec.Content))
-			conn.Write([]byte(rec.Content))
+	case "GetSuccessorList":
+		n.mu.Lock()
+		list := make([]NodeInfoWire, len(n.Successors))
+		for i, s := range n.Successors {
+			list[i] = toWire(s)
 		}
+		n.mu.Unlock()
+		enc.Encode(RPCResponse{Result: list})
 
-		// Delete migrated keys
-		for _, k := range sendKeys {
+	case "DeleteKeys":
+		var p struct {
+			Keys []string
+		}
+		json.Unmarshal(req.Params, &p)
+
+		n.mu.Lock()
+		for _, k := range p.Keys {
 			delete(n.Files, k)
 		}
-		return
+		n.mu.Unlock()
+
+		enc.Encode(RPCResponse{Result: "OK"})
 
 	default:
-		fmt.Fprintln(conn, "ERR unknown command")
-	}
-}
-
-// ListenAndServe starts a TCP server for this node and handles requests forever.
-func (n *ChordNode) ListenAndServe() error {
-	addr := fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("Listening on", addr)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			// transient error: just keep going
-			continue
-		}
-		go n.handleConnection(conn)
+		enc.Encode(RPCResponse{Error: "unknown method"})
 	}
 }
 
 func (n *ChordNode) stabilize() {
-	// First check: is successor alive?
-	if err := tryPing(n.Successors[0]); err != nil {
-		if len(n.Successors) > 1 {
-			n.Successors[0] = n.Successors[1]
+	n.mu.Lock()
+	succ := n.Successors[0]
+	n.mu.Unlock()
+
+	// 1. Check successor liveness WITHOUT holding lock
+	if err := tryPing(succ); err != nil {
+		n.mu.Lock()
+		for i := 0; i < len(n.Successors)-1; i++ {
+			n.Successors[i] = n.Successors[i+1]
 		}
-		return // stop stabilize early
+		n.Successors[len(n.Successors)-1] = n.Self
+		n.mu.Unlock()
+		return
 	}
 
-	// Now safe to query successor
-	x := rpcGetPredecessor(n.Successors[0])
-
-	if x != nil && inInterval(x.ID, n.Self.ID, n.Successors[0].ID, false) {
-		n.Successors[0] = *x
+	// 2. Ask successor for its predecessor
+	x := rpcGetPredecessor(succ)
+	if x != nil {
+		n.mu.Lock()
+		if inInterval(x.ID, n.Self.ID, n.Successors[0].ID, false) {
+			n.Successors[0] = *x
+		}
+		n.mu.Unlock()
 	}
 
-	// After updating Successors[0]
-	other := rpcGetSuccessorList(n.Successors[0])
+	// 3. Refresh successor list
+	other := rpcGetSuccessorList(succ)
 	if other != nil {
-		for i := 1; i < len(n.Successors); i++ {
-			if i < len(other) {
-				n.Successors[i] = other[i-1]
-			}
+		n.mu.Lock()
+		for i := 1; i < len(n.Successors) && i-1 < len(other); i++ {
+			n.Successors[i] = other[i-1]
 		}
+		n.mu.Unlock()
 	}
 
-	// Notify successor
-	addr := fmt.Sprintf("%s:%d", n.Successors[0].IP, n.Successors[0].Port)
-	conn, err := net.Dial("tcp", addr)
-	if err == nil {
-		fmt.Fprintf(conn, "NOTIFY %s %s %d\n",
-			idToHex(n.Self.ID), n.Self.IP, n.Self.Port)
-		conn.Close()
+	// 4. Notify successor
+	n.mu.Lock()
+	succ = n.Successors[0]
+	n.mu.Unlock()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", succ.IP, succ.Port))
+	if err != nil {
+		return
 	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	enc.Encode(RPCRequest{
+		Method: "Notify",
+		Params: mustJSON(toWire(n.Self)),
+	})
+}
+
+func mustJSON(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func (n *ChordNode) stabilizeLoop(interval time.Duration) {
@@ -363,15 +389,20 @@ func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 }
 
 func (n *ChordNode) checkPredecessor() {
-	if n.Predecessor == nil {
+	n.mu.Lock()
+	pred := n.Predecessor
+	n.mu.Unlock()
+
+	if pred == nil {
 		return
 	}
 
-	addr := fmt.Sprintf("%s:%d", n.Predecessor.IP, n.Predecessor.Port)
+	addr := fmt.Sprintf("%s:%d", pred.IP, pred.Port)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		// predecessor failed
+		n.mu.Lock()
 		n.Predecessor = nil
+		n.mu.Unlock()
 		return
 	}
 	conn.Close()
@@ -385,19 +416,21 @@ func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 	}
 }
 
-var nextFinger = 0
-
 func (n *ChordNode) fixFingers() {
-	nextFinger = (nextFinger + 1) % mBits
+	n.mu.Lock()
+	n.nextFinger = (n.nextFinger + 1) % mBits
 
 	start := new(big.Int)
-	twoPow := new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(nextFinger)), nil)
+	twoPow := new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(n.nextFinger)), nil)
 	start.Add(n.Self.ID, twoPow)
 	start.Mod(start, new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil))
+	n.mu.Unlock()
 
 	succ := n.findSuccessor(start)
 	if succ != nil {
-		n.Fingers[nextFinger] = *succ
+		n.mu.Lock()
+		n.Fingers[n.nextFinger] = *succ
+		n.mu.Unlock()
 	}
 }
 
@@ -410,35 +443,37 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 }
 
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
-	// Start at ourselves
-	cur := n.Self
+	n.mu.Lock()
+	onlyNode := n.Successors[0].ID.Cmp(n.Self.ID) == 0
+	n.mu.Unlock()
 
-	for {
-		// Ask the current node who its successor is
+	//Single-node ring shortcut
+	if onlyNode {
+		return &n.Self
+	}
+
+	cur := n.Self
+	var lastSucc *NodeInfo
+
+	for hops := 0; hops < mBits; hops++ {
 		succ := rpcGetSuccessor(cur)
 		if succ == nil {
-			return nil
+			return lastSucc
 		}
+		lastSucc = succ
 
-		// If the ID is between cur and succ → answer found
 		if inInterval(id, cur.ID, succ.ID, true) {
 			return succ
 		}
 
-		// Ask THAT node (not us!) for its closest preceding finger
 		cpf := rpcClosestPrecedingFinger(cur, id)
-		if cpf == nil {
+		if cpf == nil || cpf.ID.Cmp(cur.ID) == 0 {
 			return succ
 		}
 
-		// If no progress can be made, give up and return successor
-		if cpf.ID.Cmp(cur.ID) == 0 {
-			return succ
-		}
-
-		// Hop to next node
 		cur = *cpf
 	}
+	return lastSucc
 }
 
 // inInterval returns true if x ∈ (a, b] or (a, b), depending on inclusiveEnd.
@@ -467,332 +502,336 @@ func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 }
 
 // closestPrecedingFinger returns the closest finger preceding the target ID.
-func (n *ChordNode) closestPrecedingFinger(target *NodeID) NodeInfo {
-	// We scan backwards from the largest finger index.
+func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 	for i := len(n.Fingers) - 1; i >= 0; i-- {
-		finger := n.Fingers[i]
-		if finger.ID != nil && inInterval(finger.ID, n.Self.ID, target, false) {
-			return finger
+		if n.Fingers[i].ID != nil &&
+			inInterval(n.Fingers[i].ID, n.Self.ID, target, false) {
+			return &n.Fingers[i]
 		}
 	}
-	// If none match, return ourselves.
-	return n.Self
+	return &n.Self
 }
 
 func rpcGetPredecessor(target NodeInfo) *NodeInfo {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", target.IP+":"+strconv.Itoa(target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintln(conn, "GETPRED")
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return nil
-	}
-	resp = strings.TrimSpace(resp)
+	enc.Encode(RPCRequest{Method: "GetPredecessor"})
 
-	if resp == "NIL" {
-		return nil
-	}
-
-	parts := strings.Fields(resp)
-	if len(parts) != 3 {
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	id, err := parseHexToID(parts[0])
-	if err != nil {
-		return nil
-	}
-	portVal, err := strconv.Atoi(parts[2])
-	if err != nil {
+	if resp.Result == nil {
 		return nil
 	}
 
-	return &NodeInfo{
-		ID:   id,
-		IP:   parts[1],
-		Port: portVal,
+	b, _ := json.Marshal(resp.Result)
+	var pw NodeInfoWire
+	if err := json.Unmarshal(b, &pw); err != nil {
+		return nil
 	}
+	return fromWire(pw)
+
 }
 
 func rpcClosestPrecedingFinger(target NodeInfo, id *NodeID) *NodeInfo {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "CPF %s\n", idToHex(id))
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
+	enc.Encode(RPCRequest{
+		Method: "ClosestPrecedingFinger",
+		Params: mustJSON(struct{ ID string }{idToHex(id)}),
+	})
+
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) != 3 {
+	b, _ := json.Marshal(resp.Result)
+	var pw NodeInfoWire
+	if err := json.Unmarshal(b, &pw); err != nil {
 		return nil
 	}
+	return fromWire(pw)
 
-	nid, _ := parseHexToID(parts[0])
-	portVal, _ := strconv.Atoi(parts[2])
-
-	return &NodeInfo{
-		ID:   nid,
-		IP:   parts[1],
-		Port: portVal,
-	}
 }
 
 func rpcGetSuccessor(target NodeInfo) *NodeInfo {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintln(conn, "GETSUCC")
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return nil
-	}
-	parts := strings.Fields(resp)
-	if len(parts) != 3 {
-		return nil
-	}
+	// Send request
+	enc.Encode(RPCRequest{
+		Method: "GetSuccessor",
+		Params: json.RawMessage(`{}`),
+	})
 
-	id, err := parseHexToID(parts[0])
-	if err != nil {
-		return nil
-	}
-	portVal, err := strconv.Atoi(parts[2])
-	if err != nil {
+	// Read response
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	return &NodeInfo{
-		ID:   id,
-		IP:   parts[1],
-		Port: portVal,
+	// Decode result into NodeInfo
+	data, _ := json.Marshal(resp.Result)
+	var pw NodeInfoWire
+	if err := json.Unmarshal(data, &pw); err != nil {
+		return nil
 	}
+	return fromWire(pw)
+
 }
 
 func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "FINDSUCC %s\n", idToHex(id))
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return nil
-	}
-	resp = strings.TrimSpace(resp)
-	parts := strings.Fields(resp)
-	if len(parts) != 3 {
-		return nil
-	}
+	enc.Encode(RPCRequest{
+		Method: "FindSuccessor",
+		Params: mustJSON(struct{ ID string }{idToHex(id)}),
+	})
 
-	newID, err := parseHexToID(parts[0])
-	if err != nil {
-		return nil
-	}
-	portVal, err := strconv.Atoi(parts[2])
-	if err != nil {
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	return &NodeInfo{
-		ID:   newID,
-		IP:   parts[1],
-		Port: portVal,
+	b, _ := json.Marshal(resp.Result)
+	var pw NodeInfoWire
+	if err := json.Unmarshal(b, &pw); err != nil {
+		return nil
 	}
+	return fromWire(pw)
+
 }
+
 func rpcPutFile(target NodeInfo, key, name, content string) bool {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "PUTFILE %s %s %d\n", key, name, len(content))
-	conn.Write([]byte(content))
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	resp, _ := bufio.NewReader(conn).ReadString('\n')
-	return strings.TrimSpace(resp) == "OK"
+	enc.Encode(RPCRequest{
+		Method: "PutFile",
+		Params: mustJSON(struct {
+			Key     string
+			Name    string
+			Content string
+		}{
+			Key:     key,
+			Name:    name,
+			Content: content,
+		}),
+	})
+
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
+		return false
+	}
+
+	return true
 }
+
 func rpcGetFile(target NodeInfo, key string) *FileRecord {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "GETFILE %s\n", key)
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	reader := bufio.NewReader(conn)
-	header, err := reader.ReadString('\n')
-	if err != nil {
+	enc.Encode(RPCRequest{
+		Method: "GetFile",
+		Params: mustJSON(struct{ Key string }{key}),
+	})
+
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	header = strings.TrimSpace(header)
-	if header == "NIL" {
+	if resp.Result == nil {
 		return nil
 	}
 
-	parts := strings.Fields(header)
-	if len(parts) != 3 || parts[0] != "OK" {
-		return nil
-	}
-
-	name := parts[1]
-	size, _ := strconv.Atoi(parts[2])
-
-	buf := make([]byte, size)
-	_, err = io.ReadFull(reader, buf)
-	if err != nil {
-		return nil
-	}
-
-	return &FileRecord{
-		Name:    name,
-		Content: string(buf),
-	}
+	b, _ := json.Marshal(resp.Result)
+	var rec FileRecord
+	json.Unmarshal(b, &rec)
+	return &rec
 }
 
 func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "GETRANGE %s %s\n", lowHex, highHex)
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	reader := bufio.NewReader(conn)
+	enc.Encode(RPCRequest{
+		Method: "GetRange",
+		Params: mustJSON(struct {
+			Low  string
+			High string
+		}{
+			Low:  lowHex,
+			High: highHex,
+		}),
+	})
 
-	// First line must be: COUNT <n>
-	line, err := reader.ReadString('\n')
-	if err != nil {
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
-	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) != 2 || parts[0] != "COUNT" {
+
+	if resp.Result == nil {
 		return nil
 	}
 
-	count, _ := strconv.Atoi(parts[1])
-	result := make(map[string]FileRecord)
-
-	for i := 0; i < count; i++ {
-		header, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		h := strings.Fields(strings.TrimSpace(header))
-		if len(h) != 3 {
-			break
-		}
-
-		key := h[0]
-		name := h[1]
-		size, _ := strconv.Atoi(h[2])
-
-		buf := make([]byte, size)
-		_, err = io.ReadFull(reader, buf)
-		if err != nil {
-			break
-		}
-
-		result[key] = FileRecord{
-			Name:    name,
-			Content: string(buf),
-		}
-	}
-
+	b, _ := json.Marshal(resp.Result)
+	var result map[string]FileRecord
+	json.Unmarshal(b, &result)
 	return result
 }
 
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
-	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", target.IP, target.Port))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 
-	// Ask for successor list
-	fmt.Fprintln(conn, "GETSUCCLIST")
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
 
-	reader := bufio.NewReader(conn)
+	enc.Encode(RPCRequest{
+		Method: "GetSuccessorList",
+		Params: json.RawMessage(`{}`),
+	})
 
-	// First line: how many successors
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return nil
-	}
-	line = strings.TrimSpace(line)
-	count, err := strconv.Atoi(line)
-	if err != nil || count <= 0 {
+	var resp RPCResponse
+	if err := dec.Decode(&resp); err != nil || resp.Error != "" {
 		return nil
 	}
 
-	result := make([]NodeInfo, 0, count)
-	for i := 0; i < count; i++ {
-		row, err := reader.ReadString('\n')
-		if err != nil {
-			return result // return what we got so far
-		}
-		row = strings.TrimSpace(row)
-		parts := strings.Fields(row)
-		if len(parts) != 3 {
-			continue
-		}
-
-		id, err := parseHexToID(parts[0])
-		if err != nil {
-			continue
-		}
-		portVal, err := strconv.Atoi(parts[2])
-		if err != nil {
-			continue
-		}
-
-		result = append(result, NodeInfo{
-			ID:   id,
-			IP:   parts[1],
-			Port: portVal,
-		})
+	b, _ := json.Marshal(resp.Result)
+	var wires []NodeInfoWire
+	if err := json.Unmarshal(b, &wires); err != nil {
+		return nil
 	}
 
-	return result
+	list := make([]NodeInfo, 0, len(wires))
+	for _, w := range wires {
+		n := fromWire(w)
+		if n != nil {
+			list = append(list, *n)
+		}
+	}
+	return list
+
 }
 
 func tryPing(n NodeInfo) error {
-	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", n.IP, n.Port))
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	fmt.Fprintln(conn, "PING")
-	return nil
+
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
+
+	enc.Encode(RPCRequest{Method: "Ping"})
+
+	var resp RPCResponse
+	return dec.Decode(&resp)
+}
+
+func (n *ChordNode) ListenAndServe() error {
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port))
+	if err != nil {
+		return err
+	}
+	for {
+		conn, err := ln.Accept()
+		if err == nil {
+			go n.handleConnection(conn)
+		}
+	}
+}
+
+func (n *ChordNode) migrateKeysFromSuccessor() {
+	n.mu.Lock()
+	pred := n.Predecessor
+	self := n.Self
+	succ := n.Successors[0]
+	n.mu.Unlock()
+
+	if pred == nil || succ.ID.Cmp(self.ID) == 0 {
+		return
+	}
+
+	keys := rpcGetRange(succ, idToHex(pred.ID), idToHex(self.ID))
+	if keys == nil || len(keys) == 0 {
+		return
+	}
+
+	// Store locally
+	var keyList []string
+	n.mu.Lock()
+	for k, v := range keys {
+		n.Files[k] = v
+		keyList = append(keyList, k)
+	}
+	n.mu.Unlock()
+
+	// Tell successor to delete transferred keys
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", succ.IP, succ.Port))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	enc.Encode(RPCRequest{
+		Method: "DeleteKeys",
+		Params: mustJSON(struct{ Keys []string }{keyList}),
+	})
 }
 
 func main() {
@@ -901,24 +940,6 @@ func main() {
 		}
 
 		node.Successors[0] = *succ
-		// Attempt immediate key migration from successor
-		succLow := node.Predecessor
-		if succLow == nil {
-			// if we don't know predecessor yet, assume full interval from successor->self
-			succLow = &NodeInfo{ID: succ.ID}
-		}
-
-		lowHex := idToHex(succLow.ID)
-		highHex := idToHex(myID)
-
-		files := rpcGetRange(*succ, lowHex, highHex)
-		if files != nil {
-			for k, rec := range files {
-				node.Files[k] = rec
-			}
-		}
-
-		fmt.Println("Migrated", len(files), "keys from successor.")
 
 		fmt.Println("Joined ring. My successor is:", idToHex(succ.ID), succ.IP, succ.Port)
 	} else {
@@ -994,10 +1015,6 @@ func main() {
 				} else {
 					fmt.Println("Remote store failed")
 				}
-			}
-			for i := 1; i < len(node.Successors); i++ {
-				succ := node.Successors[i]
-				rpcPutFile(succ, keyHex, name, string(data))
 			}
 
 		case "Lookup":
