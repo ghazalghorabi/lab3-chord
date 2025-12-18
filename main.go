@@ -201,52 +201,56 @@ func (n *ChordNode) PrintState() { // this function lets you see the nodes routi
 
 // ============================= RPC server Handler (respond to other nodes) =========================================================
 
-func (n *ChordNode) handleConnection(conn net.Conn) {
-	defer conn.Close()
+func (n *ChordNode) handleConnection(conn net.Conn) { // handles one incoming TCP connection and closes when its done, this function belongs to chordNode and it runs every time another node connects to this node
+	// Recieve one JSON request, decode it or safely reject if it's invalid. The code belowm sets up a JSON based RPC connection, reads one request from a remote node and safely rejects invalid requests before processing them
 
-	dec := json.NewDecoder(conn)
-	enc := json.NewEncoder(conn)
+	//conn represents the open network connection. This is the server side networking core of the chord node. Without this nodes could not talk to each other at all
+	defer conn.Close() // this runs when the function finishes, defer means runs this later, this ensures that the network connection is always closed properly
 
-	var req RPCRequest
-	if err := dec.Decode(&req); err != nil {
-		enc.Encode(RPCResponse{Error: "invalid request"})
-		return
+	dec := json.NewDecoder(conn) // creates an object that can read JSON from the network connection; it will turn incoming JSON text into Go structs
+	enc := json.NewEncoder(conn) // creates an onjecy that can write JSON to the network connection, it will turn GO structs into JSON text. This is how we send messages back to the other node
+
+	var req RPCRequest                       // creates an empty RPCRequest variable, this is where the incoming request will be stored. So make a box to hold the message we are about to revieve
+	if err := dec.Decode(&req); err != nil { // tries to read JSON from the connection, converts it into the req structs, if the JSON is invalid or the connection breaks; err will not be nil. So try to read the request message from the other node
+		enc.Encode(RPCResponse{Error: "invalid request"}) // sends back a JSON response saying there was an error, this tells the caller ("your message was bad")- This prevents crashes and keeps the protocol behaviour predicatble
+		return                                            // stops executing this function, the deferred conn.Close() now runs. The connection is closed.
 	}
 
-	switch req.Method {
+	switch req.Method { // picks what action to run based on request type
 	// ============================== RPC methods (each case is one "feature") ================================================================
-	case "Ping":
-		enc.Encode(RPCResponse{Result: "PONG"})
 
-	case "GetSuccessor":
+	case "Ping":
+		enc.Encode(RPCResponse{Result: "PONG"}) // replies i am alive; helps with fault handling (checking dead nodes)
+
+	case "GetSuccessor": // reads the successor and sends it back; used by stabilization/joins
 		n.mu.Lock()
 		succ := n.Successors[0]
 		n.mu.Unlock()
 		enc.Encode(RPCResponse{Result: toWire(succ)})
 
-	case "GetPredecessor":
+	case "GetPredecessor": // reads the predecessor
 		n.mu.Lock()
 		pred := n.Predecessor
 		n.mu.Unlock()
 
-		if pred == nil {
+		if pred == nil { // returns nil if unkown; otherwise returns predecessor info; used by stabilize() to fix ring links
 			enc.Encode(RPCResponse{Result: nil})
 			return
 		}
 		enc.Encode(RPCResponse{Result: toWire(*pred)})
 
-	case "Notify":
+	case "Notify": // this is the chore chord stabilization; reads the notifying node info from request params
 		var pw NodeInfoWire
 		json.Unmarshal(req.Params, &pw)
 
-		p := fromWire(pw)
+		p := fromWire(pw) // converts to internal NodeInfo; errors if bad
 		if p == nil {
 			enc.Encode(RPCResponse{Error: "bad node info"})
 			return
 		}
 
 		n.mu.Lock()
-		remoteIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+		remoteIP := conn.RemoteAddr().(*net.TCPAddr).IP.String() // gets the real IP of whoever connected
 
 		shouldUpdate := (n.Predecessor == nil ||
 			inInterval(p.ID, n.Predecessor.ID, n.Self.ID, false)) &&
@@ -386,38 +390,52 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 
 // ================================ Stabilize ring (keep successor/links correct) ==============================================================
 
-func (n *ChordNode) stabilize() {
+func (n *ChordNode) stabilize() { // this function fixes the successor pointer and keeps the successor list fresh; so this defines a method that runs on node n; goal is to keep the ring pointers correct
+	// imagine all nodes are standing in a circle holding hands: Your successor = the person to your right and predecessor = the person to the left.
+	// stabilize() is the routine that reapeatedly fixes "who is my right" and updates backup rights
 	n.mu.Lock()
-	succ := n.Successors[0]
-	n.mu.Unlock()
+	succ := n.Successors[0] // copy the best known successor
+	n.mu.Unlock()           // done reading
+	// the node is running stabilize + fixFingers+ server threads at once. Without locks, you could read half-updated state
 
-	if err := tryPing(succ); err != nil {
-		n.mu.Lock()
-		for i := 0; i < len(n.Successors)-1; i++ {
-			n.Successors[i] = n.Successors[i+1]
+	if err := tryPing(succ); err != nil { // check if the successor is alive: tryPing(succ) tries to connect and do "ping"; if it fails -> successor is proabably dead or unreachable
+		n.mu.Lock()                                // lock beacuse we're editing shared state
+		for i := 0; i < len(n.Successors)-1; i++ { // this loop shifts successor list to the left  for example (before): Successors = [A,B,C,D] if A is dead, shift: Successors = [B,C,D,?]
+			n.Successors[i] = n.Successors[i+1] // move backup forward, this is the fallback plan when a successor fails. it why the lab asks for -r successors
 		}
-		n.Successors[len(n.Successors)-1] = n.Self
-		n.mu.Unlock()
-		return
+		// i := start at the first slot, i < len(n.Successors)-1; stop before last
+		n.Successors[len(n.Successors)-1] = n.Self // fill the last slot with self as a safe placeholder, this avoids having "empty" values, meaning: if you run out of known successors, worst case you point to yourself;not ideal but safe because it prevents nil or invalid pointers, guarantees that the node remains reachable and allows chord's stabilization to later repair the ring
+		n.mu.Unlock()                              // unlock after editing
+		return                                     // return because we cant do stabilize steps if the successor just changed and might still be strong
 	}
 
-	x := rpcGetPredecessor(succ)
-	if x != nil {
+	// if the successor is alive, continue.
+	x := rpcGetPredecessor(succ) // Ask successor "Who do you think is immediately before you", that answer is stored in x
+	// sometimes the succesor knows about a node that should actually be between you and successor (like a new join). For example: you think: me -> succ, but succ says "actually my predecessor is X". If x is between you and succ then you should update me -> x
+	if x != nil { // only proceed if successor returned a real predecessor
 		n.mu.Lock()
-		if inInterval(x.ID, n.Self.ID, n.Successors[0].ID, false) {
-			n.Successors[0] = *x
+		if inInterval(x.ID, n.Self.ID, n.Successors[0].ID, false) { // if x is between me and my successor update successor
+			//checks if x is strictly between self and current successor on the ring
+			n.Successors[0] = *x // if yes: n.Successors[0] = *x makes x to your new immediate succesor
 		}
-		n.mu.Unlock()
+		n.mu.Unlock() // unlock when done
+		//this is the key "repair" lofic that makes join converge
 	}
 
+	// re read successor (bcs it might have changed)
 	n.mu.Lock()
-	succ = n.Successors[0]
+	succ = n.Successors[0] //update local succ to match the current stored successor
 	n.mu.Unlock()
 
-	other := rpcGetSuccessorList(succ)
+	other := rpcGetSuccessorList(succ) // ask the current successor for its successor list, it returns a list of nodes after it- this is how to keep backups current to survive failures
 
-	if other != nil {
+	if other != nil { // only continue if you got a list back
 		n.mu.Lock()
+		// fill the backup successors from successors backups
+		// this loop does: i := 1; start at slot 1 because slot 0 is the direct successor
+		// i < len(n.Successors) dont go past the list
+		// i-1 < len(other); dont go past the successors list then: n.Successors[1]=other[0],n.Successors[2]=other[1] etc.
+		// so for instance My 2nd successor should be my successor’s 1st successor.
 		for i := 1; i < len(n.Successors) && i-1 < len(other); i++ {
 			n.Successors[i] = other[i-1]
 		}
@@ -425,15 +443,18 @@ func (n *ChordNode) stabilize() {
 	}
 
 	n.mu.Lock()
-	succ = n.Successors[0]
+	succ = n.Successors[0] // notify successor "I might be your predecessor"
 	n.mu.Unlock()
 
-	addr := fmt.Sprintf("%s:%d", succ.IP, succ.Port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	//connect to successor
+	addr := fmt.Sprintf("%s:%d", succ.IP, succ.Port)         // build "IP:port" string, try to connect without a timeout, builds a string like: 128.8.126.63:4170
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second) // net.DialTimeOut needs the destination in this exact format, so it creates the address of the successor we can contact it
+	//tcp means use tcp sockets, 2*time.Second means if i cant connect it in 2 seconds, give up.
+	//prevents the stabilize thread from hanging forever if the successor is down
 	if err != nil {
 		return
 	}
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	conn.SetDeadline(time.Now().Add(2 * time.Second)) // sets a maximum time for all reads and writes on this connection, even if the connection opened, the successor might freexe and never respond, this prevents blocking forever
 
 	defer conn.Close()
 
@@ -445,12 +466,14 @@ func (n *ChordNode) stabilize() {
 }
 
 // ============================ JSON helper (convert any value to raw json) ========================================================
+// turns a go value into JSON bytes so it can be put into an RPC requests params
 func mustJSON(v interface{}) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
 
 // ============================ run stabilize periodically =============================================================================
+// rums stabilize() forever every interval milliseconds to keep the chord ring correct
 func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -460,6 +483,7 @@ func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 }
 
 // ============================ check predecessor is alive (failure detection) =================================================================
+// checks if the predeccessor is still alive, if it cant connect, it sets Predecessor = nil (predecessor is considered dead)
 func (n *ChordNode) checkPredecessor() {
 	n.mu.Lock()
 	pred := n.Predecessor
@@ -482,6 +506,7 @@ func (n *ChordNode) checkPredecessor() {
 }
 
 // =============================== Run predecessor, check periodically =============================================================================
+// runs checkPredecessor() forever every interval
 func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -491,7 +516,7 @@ func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 }
 
 // =============================== Fic one finger entry (update routing shortcut) =============================================================================
-
+// updates one finger table entry, it picks the next finger index, computes the ID that finger should point to, then finds the correct node and stores it. This makes lookups faster over time
 func (n *ChordNode) fixFingers() {
 	n.mu.Lock()
 	n.nextFinger = (n.nextFinger + 1) % fingerSize
@@ -511,6 +536,7 @@ func (n *ChordNode) fixFingers() {
 }
 
 // =============================== Run FixFingers periodically =============================================================================
+// runs fixFingers() forever every interval
 func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -520,6 +546,7 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 }
 
 // =============================== Find the node responsible for an ID (start Lookup from the self node) =============================================================================
+// finds the node responsible for an ID (the "owner" node for that key) starting from this node
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	n.mu.Lock()
 	start := n.Self
@@ -528,6 +555,7 @@ func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 }
 
 // =============================== Run math: check if x is between a and b on a circle =============================================================================
+// checks if ID c is between a and b on the chord ring (handles wrap around at 0). This is core "ring math" used by stabilize and routing
 func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	mod := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
 
@@ -549,6 +577,7 @@ func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 }
 
 // =============================== Choose best next hop using finger table =============================================================================
+// Chooses the best index node to forward to using the finger table: returns the finger that is closest to (but before) target. Used for efficient routing
 func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -566,7 +595,7 @@ func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 }
 
 // =============================== RPC client: ask a node for its predecessor =============================================================================
-
+// asks another node for its predecessor using an rpc call, used by stabilize()
 func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -601,6 +630,7 @@ func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 }
 
 // =============================== RPC client: ask a node to route (findSuccessor/ next hop) =============================================================================
+// asks another node where the successor if id is (or where to forward next). This is the main building block for iterative loop
 func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -633,6 +663,7 @@ func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 }
 
 // =============================== RPC client: store a file on a remote node =============================================================================
+// sends a file to another node to store (remote StoreFile)
 func rpcPutFile(target NodeInfo, key, name, content string) bool {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -668,6 +699,7 @@ func rpcPutFile(target NodeInfo, key, name, content string) bool {
 }
 
 // =============================== RPC client: fetch a file from a remote node =============================================================================
+// asks another node for a stored file (remote lookup fetch)
 func rpcGetFile(target NodeInfo, key string) *FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -702,6 +734,7 @@ func rpcGetFile(target NodeInfo, key string) *FileRecord {
 }
 
 // =============================== RPC client: fetch all keys in an interval (for migration) =============================================================================
+// asks another node for all files whose keys fall in a key range. Used when a node joins and needs to take over keys from it successor
 func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -742,7 +775,7 @@ func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord 
 }
 
 // =============================== RPC client: fetch a node's successor list =============================================================================
-
+// asks another node for its successor list (backuop successors), used by stabilize to improve fault tolerance
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -784,7 +817,7 @@ func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 }
 
 // =============================== RPC client: ping a node (check if alive) =============================================================================
-
+// checks if a node is reachable by sending a ping RPC, used to detect dead successors/predecessors
 func tryPing(n NodeInfo) error {
 	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -805,7 +838,7 @@ func tryPing(n NodeInfo) error {
 }
 
 // =============================== TPC server: listen and handle connections =============================================================================
-
+// starts the tcp server and handles incoming connections. Every connection is processed by handleConnection
 func (n *ChordNode) ListenAndServe() error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port))
 	if err != nil {
@@ -820,6 +853,7 @@ func (n *ChordNode) ListenAndServe() error {
 }
 
 // =============================== Key migratition: copy keys from successors that now belong to me =============================================================================
+// moves files that now belong to this node from its successor. It copies keys in (predecessor, self] from the successor, stores them locally, then tells the successor to delete them
 func (n *ChordNode) migrateKeysFromSuccessor() {
 	n.mu.Lock()
 	pred := n.Predecessor
@@ -861,6 +895,7 @@ func (n *ChordNode) migrateKeysFromSuccessor() {
 }
 
 // =============================== Iterative lookup: walk node-to-node until sucessor found =============================================================================
+// iterative lookup: repeatdely asks nodes ("where do i go next?") until it finds the node that owns id. This is the core logic behind lookup/storefile routing
 func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 	cur := start
 
