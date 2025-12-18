@@ -156,46 +156,47 @@ func newChordNode(self NodeInfo, r int) *ChordNode { // creates a new chord obje
 // ================================= Print current node state ====================================
 
 func (n *ChordNode) PrintState() { // this function lets you see the nodes routings + files
-	n.mu.Lock()         // lock state so it doesnt change while printing
+	// printState() prints a snapshot of the nodes current chorde routing state and stored files, so the user can debug whether the ring is connected correctly and whether files are stored on the right node
+	n.mu.Lock()         // locks node state so it doesnt change while printing; unlocks at the end
 	defer n.mu.Unlock() // unlock when the function ends
 
-	fmt.Println("=== PrintState ===") // header text
+	fmt.Println("=== PrintState ===") // prints a title
 	fmt.Printf("Self: id=%s ip=%s port=%d\n",
 
-		idToHex(n.Self.ID), n.Self.IP, n.Self.Port) // print the ID/IP/port
+		idToHex(n.Self.ID), n.Self.IP, n.Self.Port) // prints the node's ID/IP/Port
 
-	if n.Predecessor != nil {
-		fmt.Printf("Predecessor: id=%s ip=%s port=%d\n",
+	if n.Predecessor != nil { // checks if predecessor is known
+		fmt.Printf("Predecessor: id=%s ip=%s port=%d\n", // if known, prints predecessor ID/IP/Port
 			idToHex(n.Predecessor.ID), n.Predecessor.IP, n.Predecessor.Port)
 	} else {
-		fmt.Println("Predecessor: <nil>")
+		fmt.Println("Predecessor: <nil>") //if unkown prints <nil>
 	}
 
 	fmt.Println("Successors:")
 	for i, s := range n.Successors {
-		fmt.Printf("  [%d] id=%s ip=%s port=%d\n",
+		fmt.Printf("  [%d] id=%s ip=%s port=%d\n", // print the successor list
 			i, idToHex(s.ID), s.IP, s.Port)
 	}
 
-	fmt.Println("Finger table:")
+	fmt.Println("Finger table:") // starts printing the finger table
 	for i, f := range n.Fingers {
-		if idToHex(f.ID) == idToHex(n.Self.ID) {
+		if idToHex(f.ID) == idToHex(n.Self.ID) { // skips enteries that point to yourself (they are not helpful to show)
 			continue
 		}
-		fmt.Printf("  [%d] id=%s ip=%s port=%d\n",
+		fmt.Printf("  [%d] id=%s ip=%s port=%d\n", // prints each fingers ID/IP/Port
 			i, idToHex(f.ID), f.IP, f.Port)
 	}
 
 	fmt.Println("Files:")
-	if len(n.Files) == 0 {
+	if len(n.Files) == 0 { // prints none if no files are stored here
 		fmt.Println("  (none)")
 	} else {
-		for key, rec := range n.Files {
+		for key, rec := range n.Files { // otherwise print each stored file: keyn name and content length
 			fmt.Printf("  key=%s name=%s len=%d\n", key, rec.Name, len(rec.Content))
 		}
 	}
 
-	fmt.Println("=====================")
+	fmt.Println("=====================") // prints footer and ends
 }
 
 // ============================= RPC server Handler (respond to other nodes) =========================================================
