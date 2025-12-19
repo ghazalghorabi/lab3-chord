@@ -179,7 +179,7 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// ============================== RPC methods (each case is one "feature") ================================================================
+	// ============================== RPC methods (each case handles one Chord protocol message) ================================================================
 
 	switch req.Method {
 
@@ -352,7 +352,7 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 	}
 }
 
-// ================================ Stabilize ring (keep successor/links correct) ==============================================================
+// ================================ Stabilize ring (periodically repair successor pointer and successor list) ==============================================================
 
 func (n *ChordNode) stabilize() {
 	n.mu.Lock()
@@ -492,7 +492,7 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 	}
 }
 
-// =============================== Find the node responsible for an ID (start Lookup from the self node) =============================================================================
+// =============================== Find the node responsible for an ID (start a Lookup to find the node responsible for an ID) =============================================================================
 
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	n.mu.Lock()
@@ -799,7 +799,7 @@ func (n *ChordNode) ListenAndServe() error {
 	}
 }
 
-// =============================== Key migratition: copy keys from successors that now belong to me =============================================================================
+// =============================== Key migration: copy keys from successors that now belong to me =============================================================================
 
 func (n *ChordNode) migrateKeysFromSuccessor() {
 	n.mu.Lock()
@@ -841,7 +841,7 @@ func (n *ChordNode) migrateKeysFromSuccessor() {
 	})
 }
 
-// =============================== Iterative lookup: walk node-to-node until sucessor found =============================================================================
+// =============================== Iterative lookup: walk node-to-node until the sucessor of an ID is found =============================================================================
 
 func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 	cur := start
