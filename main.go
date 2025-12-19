@@ -784,7 +784,7 @@ func tryPing(n NodeInfo) error {
 	return dec.Decode(&resp)
 }
 
-// =============================== TPC server: listen and handle connections =============================================================================
+// =============================== TCP server: listen and handle connections =============================================================================
 
 func (n *ChordNode) ListenAndServe() error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port))
