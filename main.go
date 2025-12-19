@@ -58,6 +58,8 @@ type ChordNode struct {
 	Files       map[string]FileRecord
 }
 
+// ======================Hash strings into Chord IDs and convert IDs to/from Hex ================================/
+
 func hashStringToID(s string) *NodeID {
 	h := sha1.Sum([]byte(s))
 	n := new(big.Int)
@@ -99,6 +101,8 @@ func parseHexToID(s string) (*NodeID, error) {
 	return n, nil
 }
 
+// ============================Node initialization: Build safe starting chord state ====================================================
+
 func newChordNode(self NodeInfo, r int) *ChordNode {
 	n := &ChordNode{
 		Self:        self,
@@ -108,6 +112,7 @@ func newChordNode(self NodeInfo, r int) *ChordNode {
 		nextFinger:  -1,
 		Files:       make(map[string]FileRecord),
 	}
+	// =============================== initialize successor list and finger table with safe defaults ===============================================
 
 	for i := 0; i < r; i++ {
 		n.Successors[i] = self
@@ -119,6 +124,7 @@ func newChordNode(self NodeInfo, r int) *ChordNode {
 	return n
 }
 
+// ================================= Print current node state ====================================
 func (n *ChordNode) PrintState() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -160,6 +166,7 @@ func (n *ChordNode) PrintState() {
 	fmt.Println("=====================")
 }
 
+// ============================= RPC server Handler (respond to other nodes) =========================================================
 func (n *ChordNode) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -171,6 +178,8 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 		enc.Encode(RPCResponse{Error: "invalid request"})
 		return
 	}
+
+	// ============================== RPC methods (each case is one "feature") ================================================================
 
 	switch req.Method {
 
@@ -343,6 +352,8 @@ func (n *ChordNode) handleConnection(conn net.Conn) {
 	}
 }
 
+// ================================ Stabilize ring (keep successor/links correct) ==============================================================
+
 func (n *ChordNode) stabilize() {
 	n.mu.Lock()
 	succ := n.Successors[0]
@@ -401,10 +412,14 @@ func (n *ChordNode) stabilize() {
 	})
 }
 
+// ============================ JSON helper (convert any value to raw json) ========================================================
+
 func mustJSON(v interface{}) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
+
+// ============================ run stabilize periodically =============================================================================
 
 func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 	for {
@@ -413,6 +428,8 @@ func (n *ChordNode) stabilizeLoop(interval time.Duration) {
 		//fmt.Println("[stabilize] done")
 	}
 }
+
+// ============================ check predecessor is alive (failure detection) =================================================================
 
 func (n *ChordNode) checkPredecessor() {
 	n.mu.Lock()
@@ -435,6 +452,8 @@ func (n *ChordNode) checkPredecessor() {
 	conn.Close()
 }
 
+// =============================== Run predecessor, check periodically =============================================================================
+
 func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -442,6 +461,8 @@ func (n *ChordNode) checkPredecessorLoop(interval time.Duration) {
 		//fmt.Println("[checkPredecessor] done")
 	}
 }
+
+// =============================== Fix one finger entry (update routing shortcut) =============================================================================
 
 func (n *ChordNode) fixFingers() {
 	n.mu.Lock()
@@ -461,6 +482,8 @@ func (n *ChordNode) fixFingers() {
 	}
 }
 
+// =============================== Run FixFingers periodically =============================================================================
+
 func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -469,12 +492,16 @@ func (n *ChordNode) fixFingersLoop(interval time.Duration) {
 	}
 }
 
+// =============================== Find the node responsible for an ID (start Lookup from the self node) =============================================================================
+
 func (n *ChordNode) findSuccessor(id *NodeID) *NodeInfo {
 	n.mu.Lock()
 	start := n.Self
 	n.mu.Unlock()
 	return rpcLookupSuccessor(start, id)
 }
+
+// =============================== Run math: check if x is between a and b on a circle =============================================================================
 
 func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	mod := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
@@ -496,6 +523,8 @@ func inInterval(x, a, b *NodeID, inclusiveEnd bool) bool {
 	return xN.Cmp(aN) > 0 || xN.Cmp(bN) < 0
 }
 
+// =============================== Choose best next hop using finger table =============================================================================
+
 func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -511,6 +540,8 @@ func (n *ChordNode) closestPrecedingFinger(target *NodeID) *NodeInfo {
 	out := n.Self
 	return &out
 }
+
+// =============================== RPC client: ask a node for next-hop toward an ID =============================================================================
 
 func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
@@ -545,6 +576,8 @@ func rpcGetPredecessor(target NodeInfo) *NodeInfo {
 
 }
 
+// =============================== RPC client: ask a node to route (findSuccessor/ next hop) =============================================================================
+
 func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -575,6 +608,8 @@ func rpcFindSuccessor(target NodeInfo, id *NodeID) *NodeInfo {
 	return fromWire(pw)
 
 }
+
+// =============================== RPC client: store a file on a remote node =============================================================================
 
 func rpcPutFile(target NodeInfo, key, name, content string) bool {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
@@ -610,6 +645,8 @@ func rpcPutFile(target NodeInfo, key, name, content string) bool {
 	return true
 }
 
+// =============================== RPC client: fetch a file from a remote node =============================================================================
+
 func rpcGetFile(target NodeInfo, key string) *FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -642,6 +679,8 @@ func rpcGetFile(target NodeInfo, key string) *FileRecord {
 	json.Unmarshal(b, &rec)
 	return &rec
 }
+
+// =============================== RPC client: fetch all keys in an interval (for migration) =============================================================================
 
 func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
@@ -681,6 +720,8 @@ func rpcGetRange(target NodeInfo, lowHex, highHex string) map[string]FileRecord 
 	json.Unmarshal(b, &result)
 	return result
 }
+
+// =============================== RPC client: fetch a node's successor list =============================================================================
 
 func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
@@ -722,6 +763,8 @@ func rpcGetSuccessorList(target NodeInfo) []NodeInfo {
 
 }
 
+// =============================== RPC client: ping a node (check if alive) =============================================================================
+
 func tryPing(n NodeInfo) error {
 	addr := fmt.Sprintf("%s:%d", n.IP, n.Port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -741,6 +784,8 @@ func tryPing(n NodeInfo) error {
 	return dec.Decode(&resp)
 }
 
+// =============================== TPC server: listen and handle connections =============================================================================
+
 func (n *ChordNode) ListenAndServe() error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", n.Self.IP, n.Self.Port))
 	if err != nil {
@@ -753,6 +798,8 @@ func (n *ChordNode) ListenAndServe() error {
 		}
 	}
 }
+
+// =============================== Key migratition: copy keys from successors that now belong to me =============================================================================
 
 func (n *ChordNode) migrateKeysFromSuccessor() {
 	n.mu.Lock()
@@ -794,6 +841,8 @@ func (n *ChordNode) migrateKeysFromSuccessor() {
 	})
 }
 
+// =============================== Iterative lookup: walk node-to-node until sucessor found =============================================================================
+
 func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 	cur := start
 
@@ -816,6 +865,8 @@ func rpcLookupSuccessor(start NodeInfo, id *NodeID) *NodeInfo {
 	}
 	return nil
 }
+
+// =============================== Program startup: parse flags, create/join ring, run loops, read commands =============================================================================
 
 func main() {
 	ip := flag.String("a", "", "IP address to bind and advertise")
